@@ -1,3 +1,4 @@
+
 use anyhow::Result;
 use async_trait::async_trait;
 use bench_core::adapter::{
@@ -21,7 +22,9 @@ use testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
 use tonic::transport::{Channel, Endpoint};
 
 pub mod proto {
-    tonic::include_proto!("boomerang.eventstore");
+    // Generated from protos/sellistix/slingshot/v1/event_store.proto.
+    // The old boomerang.eventstore package is not wire-compatible with this server.
+    tonic::include_proto!("sellistix.slingshot.v1");
 }
 
 const UNCONDITIONAL_TAG: &str = "__esb_unconditional__";
@@ -174,7 +177,8 @@ impl StoreManager for BoomerangStoreManager {
     }
 
     async fn pull(&mut self) -> Result<()> {
-        // boomerang:local is built from Patterns (`docker build ... -t boomerang:local`).
+        // The image is built locally (`scripts/smoke-*.sh`) and tagged boomerang:local,
+        // or whatever BOOMERANG_IMAGE names. There is no registry pull.
         Ok(())
     }
 
@@ -348,6 +352,7 @@ impl BoomerangAdapter {
         };
         let mut client = self.client.clone();
         let response = client.append_dcb(request).await?.into_inner();
+        refuse_follower(response.not_leader, &response.leader_endpoint, "AppendDcb")?;
         Ok(Self::last_position(&response.sequence_positions))
     }
 
@@ -384,9 +389,15 @@ impl BoomerangAdapter {
         };
         let mut client = self.client.clone();
         let response = client.append_stream(request).await?.into_inner();
+        refuse_follower(
+            response.not_leader,
+            &response.leader_endpoint,
+            "AppendStream",
+        )?;
         Ok(Self::last_position(&response.sequence_positions))
     }
 
+    #[allow(dead_code)] // kept for tests; the hot path reads by query
     async fn read_stream_by_id(
         &self,
         stream_id: &str,
@@ -429,6 +440,17 @@ impl BoomerangAdapter {
             Some(after) => after.saturating_add(1) as i64,
         }
     }
+}
+
+/// Cluster followers return `not_leader` instead of committing. A smoke run pointed at
+/// the wrong node must fail here; an empty sequence list would otherwise look like success.
+fn refuse_follower(not_leader: bool, leader_endpoint: &str, rpc: &str) -> Result<()> {
+    if not_leader {
+        anyhow::bail!(
+            "{rpc} reached a follower (leader_endpoint={leader_endpoint}). Point BOOMERANG_URI at the Raft leader."
+        );
+    }
+    Ok(())
 }
 
 /// PascalCase QueryItem JSON. Omit empty Types/Tags so Boomerang treats them as
@@ -1068,3 +1090,5 @@ mod tests {
         assert_eq!(manager.store_name, "boomerang");
     }
 }
+
+

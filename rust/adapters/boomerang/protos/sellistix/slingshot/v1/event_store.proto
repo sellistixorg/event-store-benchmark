@@ -1,7 +1,9 @@
+
 syntax = "proto3";
 
-option csharp_namespace = "Sellistix.Patterns.EventSourcing.Boomerang.Raft.Client.Protos";
-package boomerang.eventstore;
+package sellistix.slingshot.v1;
+
+option csharp_namespace = "Sellistix.Slingshot.Protos.V1";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EventStore service — exposes IEventStore + IStreamRegistry + portable Subscribe
@@ -201,3 +203,5 @@ message GetCurrentSequenceRequest {}
 message GetCurrentSequenceResponse {
   int64 current_sequence = 1;
 }
+
+
