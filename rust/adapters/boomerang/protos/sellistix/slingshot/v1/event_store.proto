@@ -83,6 +83,7 @@ message AppendStreamRequest {
   sint64                    expected_version = 3;   // -1 = no check
   bytes                     metadata_json    = 4;
   repeated string           tags             = 5;
+  string                    request_id       = 6;   // optional; empty = unset
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +94,7 @@ message AppendDcbRequest {
   bytes                         condition_json = 2;   // JSON-encoded AppendCondition
   bytes                         metadata_json  = 3;
   repeated string               tags           = 4;
+  string                        request_id     = 5;   // optional; empty = unset
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
