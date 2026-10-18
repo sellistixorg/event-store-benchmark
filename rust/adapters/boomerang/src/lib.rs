@@ -1,3 +1,7 @@
+// Prost request literals end with `..Default::default()` so a new optional
+// Slingshot field does not break this adapter. Clippy sees no effect until
+// that field exists.
+#![allow(clippy::needless_update)]
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -10,9 +14,8 @@ use bench_testcontainers::boomerang::{Boomerang, BOOMERANG_PORT};
 use proto::event_store_service_client::EventStoreServiceClient;
 use proto::{
     subscribe_request, AppendDcbRequest, AppendStreamRequest, GetCurrentSequenceRequest,
-    QueryItemProto, QueryProto, ReadStreamRequest,
-    ReadByQueryRequest, ReadByQueryStreamRequest, SequencedEventProto, SerializedEventProto,
-    SubscribeRequest,
+    QueryItemProto, QueryProto, ReadByQueryRequest, ReadByQueryStreamRequest, ReadStreamRequest,
+    SequencedEventProto, SerializedEventProto, SubscribeRequest,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -20,6 +23,7 @@ use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
 use tonic::transport::{Channel, Endpoint};
+use tonic_types::StatusExt;
 
 pub mod proto {
     // Generated from protos/sellistix/slingshot/v1/event_store.proto.
@@ -53,15 +57,15 @@ fn query_proto(tag: &str, event_type: Option<&str>) -> Option<QueryProto> {
     }
     Some(QueryProto {
         items: vec![QueryItemProto {
-            types: event_type
-                .map(|t| vec![t.to_string()])
-                .unwrap_or_default(),
+            types: event_type.map(|t| vec![t.to_string()]).unwrap_or_default(),
             tags: if has_tag {
                 vec![tag.to_string()]
             } else {
                 Vec::new()
             },
+            ..Default::default()
         }],
+        ..Default::default()
     })
 }
 
@@ -128,8 +132,7 @@ impl StoreManager for BoomerangStoreManager {
             let mount_path = self.data_dir.setup()?;
             #[cfg_attr(not(unix), allow(unused_variables))]
             let is_bind_mount = mount_path.is_some();
-            let mut image: ContainerRequest<_> =
-                Boomerang::new(mount_path, self.durability).into();
+            let mut image: ContainerRequest<_> = Boomerang::new(mount_path, self.durability).into();
 
             #[cfg(unix)]
             if is_bind_mount {
@@ -164,8 +167,11 @@ impl StoreManager for BoomerangStoreManager {
                     async move {
                         let mut client = connect_client(&uri).await?;
                         client
-                            .get_current_sequence(GetCurrentSequenceRequest {})
-                            .await?;
+                            .get_current_sequence(GetCurrentSequenceRequest {
+                                ..Default::default()
+                            })
+                            .await
+                            .map_err(|status| grpc_status_error(status, "GetCurrentSequence"))?;
                         Ok::<(), anyhow::Error>(())
                     }
                 },
@@ -266,6 +272,7 @@ impl BoomerangAdapter {
                 payload: evt.payload.to_vec(),
                 codec_id: 255, // opaque / unspecified bytes — raw sittings are not MemoryPack
                 schema_version: 0,
+                ..Default::default()
             })
             .collect()
     }
@@ -349,11 +356,10 @@ impl BoomerangAdapter {
             condition_json: Self::condition_json(condition),
             metadata_json: Self::metadata_json(events),
             tags: Self::batch_tags(events),
-            // Empty default. The server ignores request_id today.
-            request_id: String::new(),
+            ..Default::default()
         };
         let mut client = self.client.clone();
-        let response = client.append_dcb(request).await?.into_inner();
+        let response = check_rpc(client.append_dcb(request).await, "AppendDcb")?.into_inner();
         refuse_follower(response.not_leader, &response.leader_endpoint, "AppendDcb")?;
         Ok(Self::last_position(&response.sequence_positions))
     }
@@ -388,11 +394,10 @@ impl BoomerangAdapter {
             expected_version: Self::expected_version(stream_position),
             metadata_json: Self::metadata_json(events),
             tags: Self::batch_tags(events),
-            // Empty default. The server ignores request_id today.
-            request_id: String::new(),
+            ..Default::default()
         };
         let mut client = self.client.clone();
-        let response = client.append_stream(request).await?.into_inner();
+        let response = check_rpc(client.append_stream(request).await, "AppendStream")?.into_inner();
         refuse_follower(
             response.not_leader,
             &response.leader_endpoint,
@@ -402,18 +407,18 @@ impl BoomerangAdapter {
     }
 
     #[allow(dead_code)] // kept for tests; the hot path reads by query
-    async fn read_stream_by_id(
-        &self,
-        stream_id: &str,
-    ) -> anyhow::Result<Vec<SequencedEventProto>> {
+    async fn read_stream_by_id(&self, stream_id: &str) -> anyhow::Result<Vec<SequencedEventProto>> {
         let request = ReadStreamRequest {
             stream_id: stream_id.to_string(),
             from_version: 0,
             to_version: -1,
             to_timestamp: 0,
+            ..Default::default()
         };
         let mut client = self.client.clone();
-        Ok(client.read_stream(request).await?.into_inner().events)
+        Ok(check_rpc(client.read_stream(request).await, "ReadStream")?
+            .into_inner()
+            .events)
     }
 
     #[allow(dead_code)] // kept for tests; hot path sends empty query_json once proto is set
@@ -423,9 +428,7 @@ impl BoomerangAdapter {
         if !has_type && !has_tag {
             return Vec::new();
         }
-        let types: Vec<String> = event_type
-            .map(|t| vec![t.to_string()])
-            .unwrap_or_default();
+        let types: Vec<String> = event_type.map(|t| vec![t.to_string()]).unwrap_or_default();
         let tags = if has_tag {
             vec![tag.to_string()]
         } else {
@@ -446,15 +449,123 @@ impl BoomerangAdapter {
     }
 }
 
+const SLINGSHOT_ERROR_DOMAIN: &str = "slingshot.sellistix";
+const REASON_NOT_LEADER: &str = "NOT_LEADER";
+const REASON_APPEND_OUTCOME_UNKNOWN: &str = "APPEND_OUTCOME_UNKNOWN";
+
+/// Slingshot failure decoded from a `google.rpc.ErrorInfo` detail
+/// (domain `slingshot.sellistix`) on the `grpc-status-details-bin` trailer.
+///
+/// Every variant is terminal. `NOT_LEADER` is reported like the in-band flag.
+/// `APPEND_OUTCOME_UNKNOWN` may already be durable. Version and condition
+/// conflicts (`ABORTED`) must not be repeated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlingshotFailure {
+    NotLeader { leader_endpoint: String },
+    AppendOutcomeUnknown,
+    Conflict { reason: String },
+}
+
+impl SlingshotFailure {
+    fn retryable(&self) -> bool {
+        match self {
+            Self::NotLeader { .. } | Self::AppendOutcomeUnknown | Self::Conflict { .. } => false,
+        }
+    }
+}
+
+/// Read a Slingshot reason when the status carries one. `ABORTED` with no
+/// reason is still a version or condition conflict.
+fn slingshot_failure(status: &tonic::Status) -> Option<SlingshotFailure> {
+    if let Some(info) = status
+        .get_details_error_info()
+        .filter(|info| info.domain == SLINGSHOT_ERROR_DOMAIN)
+    {
+        match (status.code(), info.reason.as_str()) {
+            (tonic::Code::Unavailable, REASON_NOT_LEADER) => {
+                return Some(SlingshotFailure::NotLeader {
+                    leader_endpoint: info
+                        .metadata
+                        .get("leader_endpoint")
+                        .cloned()
+                        .unwrap_or_default(),
+                });
+            }
+            (tonic::Code::FailedPrecondition, REASON_APPEND_OUTCOME_UNKNOWN) => {
+                return Some(SlingshotFailure::AppendOutcomeUnknown);
+            }
+            (tonic::Code::Aborted, reason) => {
+                return Some(SlingshotFailure::Conflict {
+                    reason: reason.to_string(),
+                });
+            }
+            _ => {}
+        }
+    } else if status.code() == tonic::Code::Aborted {
+        return Some(SlingshotFailure::Conflict {
+            reason: String::new(),
+        });
+    }
+    None
+}
+
+/// `NOT_LEADER`, `APPEND_OUTCOME_UNKNOWN`, and version/condition conflicts are
+/// never retried. Bare `FAILED_PRECONDITION` and `ABORTED` are not retried
+/// either, including when the reason trailer has not been attached yet.
+fn grpc_status_retryable(status: &tonic::Status) -> bool {
+    if slingshot_failure(status).is_some() {
+        return false;
+    }
+    !matches!(
+        status.code(),
+        tonic::Code::Aborted | tonic::Code::FailedPrecondition
+    )
+}
+
+fn follower_error(leader_endpoint: &str, rpc: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{rpc} reached a follower (leader_endpoint={leader_endpoint}). Point BOOMERANG_URI at the Raft leader."
+    )
+}
+
 /// Cluster followers return `not_leader` instead of committing. A smoke run pointed at
 /// the wrong node must fail here; an empty sequence list would otherwise look like success.
+/// Reason `NOT_LEADER` on the gRPC status uses the same error.
 fn refuse_follower(not_leader: bool, leader_endpoint: &str, rpc: &str) -> Result<()> {
     if not_leader {
-        anyhow::bail!(
-            "{rpc} reached a follower (leader_endpoint={leader_endpoint}). Point BOOMERANG_URI at the Raft leader."
-        );
+        return Err(follower_error(leader_endpoint, rpc));
     }
     Ok(())
+}
+
+fn grpc_status_error(status: tonic::Status, rpc: &str) -> anyhow::Error {
+    let Some(failure) = slingshot_failure(&status) else {
+        // No decoded reason. Still do not retry ABORTED or FAILED_PRECONDITION;
+        // those codes are the conflict and unknown-outcome statuses.
+        return anyhow::Error::from(status);
+    };
+    debug_assert!(!failure.retryable());
+    debug_assert!(!grpc_status_retryable(&status));
+    match failure {
+        SlingshotFailure::NotLeader { leader_endpoint } => follower_error(&leader_endpoint, rpc),
+        SlingshotFailure::AppendOutcomeUnknown => anyhow::anyhow!(
+            "{rpc} failed with APPEND_OUTCOME_UNKNOWN (FAILED_PRECONDITION); not retrying: {status}"
+        ),
+        SlingshotFailure::Conflict { reason } => {
+            let detail = if reason.is_empty() {
+                "ABORTED".to_string()
+            } else {
+                reason
+            };
+            anyhow::anyhow!(
+                "{rpc} version or condition conflict ({detail}); not retrying: {status}"
+            )
+        }
+    }
+}
+
+fn check_rpc<T>(result: Result<T, tonic::Status>, rpc: &str) -> Result<T> {
+    result.map_err(|status| grpc_status_error(status, rpc))
 }
 
 /// PascalCase QueryItem JSON. Omit empty Types/Tags so Boomerang treats them as
@@ -546,9 +657,11 @@ impl EventStoreAdapter for BoomerangAdapter {
                 to_sequence_position: -1,
                 to_timestamp: 0,
                 query,
+                ..Default::default()
             };
             let mut client = self.client.clone();
-            let response = client.read_by_query(request).await?.into_inner();
+            let response =
+                check_rpc(client.read_by_query(request).await, "ReadByQuery")?.into_inner();
             let events = response.events.into_iter().map(map_read_event).collect();
             return Ok(Box::new(VecReadResponse::new(events)));
         }
@@ -560,9 +673,14 @@ impl EventStoreAdapter for BoomerangAdapter {
             to_timestamp: 0,
             limit: stream_rpc_limit(req.limit),
             query,
+            ..Default::default()
         };
         let mut client = self.client.clone();
-        let stream = client.read_by_query_stream(request).await?.into_inner();
+        let stream = check_rpc(
+            client.read_by_query_stream(request).await,
+            "ReadByQueryStream",
+        )?
+        .into_inner();
         Ok(Box::new(BoomerangReadResponse {
             stream,
             remaining: req.limit,
@@ -575,9 +693,10 @@ impl EventStoreAdapter for BoomerangAdapter {
             subscriber_id: format!("esb-{}", uuid::Uuid::new_v4()),
             from_sequence_position: from,
             scope: Some(subscribe_request::Scope::GlobalAll(true)),
+            ..Default::default()
         };
         let mut client = self.client.clone();
-        let stream = client.subscribe(request).await?.into_inner();
+        let stream = check_rpc(client.subscribe(request).await, "Subscribe")?.into_inner();
         Ok(Box::new(BoomerangReadResponse {
             stream,
             remaining: None,
@@ -592,9 +711,14 @@ impl EventStoreAdapter for BoomerangAdapter {
             to_timestamp: 0,
             limit: 0,
             query: None,
+            ..Default::default()
         };
         let mut client = self.client.clone();
-        let stream = client.read_by_query_stream(request).await?.into_inner();
+        let stream = check_rpc(
+            client.read_by_query_stream(request).await,
+            "ReadByQueryStream",
+        )?
+        .into_inner();
         Ok(Box::new(BoomerangReadResponse {
             stream,
             remaining: None,
@@ -611,10 +735,21 @@ struct BoomerangReadResponse {
 impl ReadResponse for BoomerangReadResponse {
     async fn next_event(&mut self) -> anyhow::Result<Option<ReadEvent>> {
         if matches!(self.remaining, Some(0)) {
-            while self.stream.message().await?.is_some() {}
+            while self
+                .stream
+                .message()
+                .await
+                .map_err(|status| grpc_status_error(status, "stream"))?
+                .is_some()
+            {}
             return Ok(None);
         }
-        match self.stream.message().await? {
+        match self
+            .stream
+            .message()
+            .await
+            .map_err(|status| grpc_status_error(status, "stream"))?
+        {
             Some(proto) => {
                 if let Some(ref mut n) = self.remaining {
                     *n = n.saturating_sub(1);
@@ -700,10 +835,7 @@ mod tests {
                 payload: Arc::from(vec![4, 5, 6]),
                 event_type: Arc::from("type2"),
                 tags: Arc::from([Arc::from("tag2")]),
-                metadata: Arc::from([(
-                    "timestamp".to_string(),
-                    "123456789".to_string(),
-                )]),
+                metadata: Arc::from([("timestamp".to_string(), "123456789".to_string())]),
             },
         ]
     }
@@ -862,13 +994,16 @@ mod tests {
     }
 
     fn h2h_condition_json(tag: &str, event_type: &str) -> Vec<u8> {
-        let condition = Some(EsbAppendCondition::new(
-            bench_core::adapter::EsbQuery::new().item(
-                EsbQueryItem::new()
-                    .tags(vec![tag.to_string()])
-                    .types(vec![event_type.to_string()]),
-            ),
-        ).after(Some(0)));
+        let condition = Some(
+            EsbAppendCondition::new(
+                bench_core::adapter::EsbQuery::new().item(
+                    EsbQueryItem::new()
+                        .tags(vec![tag.to_string()])
+                        .types(vec![event_type.to_string()]),
+                ),
+            )
+            .after(Some(0)),
+        );
         BoomerangAdapter::condition_json(condition)
     }
 
@@ -943,7 +1078,11 @@ mod tests {
             all_received.push(event);
         }
         assert!(
-            all_received.iter().filter(|e| e.event_type == "limited").count() >= 5,
+            all_received
+                .iter()
+                .filter(|e| e.event_type == "limited")
+                .count()
+                >= 5,
             "read_all must still stream every matching event; got {}",
             all_received.len()
         );
@@ -995,10 +1134,17 @@ mod tests {
             };
             last_pos = adapter.append_to_stream(&[evt], None, None).await?;
         }
-        assert!(last_pos.is_some(), "append_to_stream must return a global position");
+        assert!(
+            last_pos.is_some(),
+            "append_to_stream must return a global position"
+        );
 
         let events = concrete.read_stream_by_id(stream_id).await?;
-        assert_eq!(events.len(), 10, "ten events must share one Boomerang stream");
+        assert_eq!(
+            events.len(),
+            10,
+            "ten events must share one Boomerang stream"
+        );
         for (i, evt) in events.iter().enumerate() {
             assert_eq!(evt.stream_id, stream_id);
             assert_eq!(evt.version, (i + 1) as i64);
@@ -1069,9 +1215,7 @@ mod tests {
             tags: Arc::from([Arc::from(stream_id)]),
             metadata: Arc::from([]),
         };
-        adapter
-            .append_to_stream(&[evt.clone()], None, None)
-            .await?;
+        adapter.append_to_stream(&[evt.clone()], None, None).await?;
         let conflict = adapter.append_to_stream(&[evt], Some(0), None).await;
         assert!(
             conflict.is_err(),
@@ -1093,6 +1237,245 @@ mod tests {
         assert_eq!(manager.durability, "Fsync");
         assert_eq!(manager.store_name, "boomerang");
     }
+
+    /// Compile check: every prost request literal fills fields the adapter does
+    /// not set from `Default`. A new optional proto field must not break this.
+    #[test]
+    fn prost_request_literals_fill_new_fields_from_default() {
+        let append_stream = AppendStreamRequest {
+            stream_id: "stream".into(),
+            events: vec![],
+            expected_version: -1,
+            metadata_json: vec![1],
+            tags: vec!["t".into()],
+            ..Default::default()
+        };
+        assert_eq!(append_stream.stream_id, "stream");
+        assert_eq!(append_stream.expected_version, -1);
+        assert!(append_stream.request_id.is_empty());
+
+        let append_dcb = AppendDcbRequest {
+            events: vec![],
+            condition_json: vec![2],
+            metadata_json: vec![],
+            tags: vec!["t".into()],
+            ..Default::default()
+        };
+        assert_eq!(append_dcb.condition_json, vec![2]);
+        assert!(append_dcb.request_id.is_empty());
+
+        let read_stream = ReadStreamRequest {
+            stream_id: "stream".into(),
+            from_version: 0,
+            to_version: -1,
+            to_timestamp: 0,
+            ..Default::default()
+        };
+        assert_eq!(read_stream.to_version, -1);
+
+        let read_by_query = ReadByQueryRequest {
+            query_json: vec![],
+            from_sequence_position: -1,
+            limit: 10,
+            to_sequence_position: -1,
+            to_timestamp: 0,
+            query: None,
+            ..Default::default()
+        };
+        assert_eq!(read_by_query.limit, 10);
+
+        let read_by_query_stream = ReadByQueryStreamRequest {
+            query_json: vec![],
+            from_sequence_position: -1,
+            to_sequence_position: -1,
+            to_timestamp: 0,
+            limit: 0,
+            query: None,
+            ..Default::default()
+        };
+        assert_eq!(read_by_query_stream.limit, 0);
+
+        let subscribe = SubscribeRequest {
+            subscriber_id: "esb".into(),
+            from_sequence_position: 1,
+            scope: Some(subscribe_request::Scope::GlobalAll(true)),
+            ..Default::default()
+        };
+        assert_eq!(subscribe.from_sequence_position, 1);
+
+        let _current = GetCurrentSequenceRequest {
+            ..Default::default()
+        };
+
+        let event = SerializedEventProto {
+            type_name: "type".into(),
+            payload: vec![1],
+            codec_id: 255,
+            schema_version: 0,
+            ..Default::default()
+        };
+        assert_eq!(event.codec_id, 255);
+
+        let query = QueryProto {
+            items: vec![QueryItemProto {
+                types: vec!["e".into()],
+                tags: vec!["t".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(query.items[0].tags, vec!["t"]);
+
+        // Registry calls. Same literal shape, so a new optional field stays source-compatible.
+        let _ = proto::GetStreamRequest {
+            stream_id: "stream".into(),
+            ..Default::default()
+        };
+        let _ = proto::GetStreamsByAggregateTypeRequest {
+            aggregate_type: "order".into(),
+            ..Default::default()
+        };
+        let _ = proto::GetStreamsByTagRequest {
+            tag: "t".into(),
+            ..Default::default()
+        };
+        let _ = proto::EnumerateStreamIdsRequest {
+            prefix: String::new(),
+            ..Default::default()
+        };
+        let _ = proto::GetStreamCountRequest {
+            prefix: String::new(),
+            ..Default::default()
+        };
+        let updated = proto::GetStreamsUpdatedAfterRequest {
+            after_sequence_position: 4,
+            limit: 0,
+            ..Default::default()
+        };
+        assert_eq!(updated.after_sequence_position, 4);
+    }
+
+    fn status_with_reason(
+        code: tonic::Code,
+        reason: &str,
+        metadata: &[(&str, &str)],
+    ) -> tonic::Status {
+        let metadata: std::collections::HashMap<String, String> = metadata
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        tonic::Status::with_error_details(
+            code,
+            reason,
+            tonic_types::ErrorDetails::with_error_info(reason, SLINGSHOT_ERROR_DOMAIN, metadata),
+        )
+    }
+
+    #[test]
+    fn not_leader_reason_matches_in_band_follower_error() {
+        let status = status_with_reason(
+            tonic::Code::Unavailable,
+            REASON_NOT_LEADER,
+            &[("leader_endpoint", "http://10.0.0.8:50051")],
+        );
+        let failure = slingshot_failure(&status).expect("NOT_LEADER");
+        assert_eq!(
+            failure,
+            SlingshotFailure::NotLeader {
+                leader_endpoint: "http://10.0.0.8:50051".into(),
+            }
+        );
+        assert!(!failure.retryable());
+        assert!(!grpc_status_retryable(&status));
+
+        let from_trailer = grpc_status_error(status, "AppendStream");
+        let from_flag = refuse_follower(true, "http://10.0.0.8:50051", "AppendStream")
+            .expect_err("in-band not_leader fails");
+        assert_eq!(from_trailer.to_string(), from_flag.to_string());
+        assert!(refuse_follower(false, "http://10.0.0.8:50051", "AppendStream").is_ok());
+    }
+
+    #[test]
+    fn unknown_outcome_and_conflicts_are_not_retried() {
+        let unknown = status_with_reason(
+            tonic::Code::FailedPrecondition,
+            REASON_APPEND_OUTCOME_UNKNOWN,
+            &[],
+        );
+        assert_eq!(
+            slingshot_failure(&unknown),
+            Some(SlingshotFailure::AppendOutcomeUnknown)
+        );
+        assert!(!grpc_status_retryable(&unknown));
+        let unknown_err = grpc_status_error(unknown, "AppendDcb");
+        assert!(
+            unknown_err.to_string().contains("APPEND_OUTCOME_UNKNOWN")
+                && unknown_err.to_string().contains("not retrying"),
+            "{unknown_err}"
+        );
+
+        let version = status_with_reason(tonic::Code::Aborted, "EXPECTED_VERSION_CONFLICT", &[]);
+        assert_eq!(
+            slingshot_failure(&version),
+            Some(SlingshotFailure::Conflict {
+                reason: "EXPECTED_VERSION_CONFLICT".into(),
+            })
+        );
+        assert!(!grpc_status_retryable(&version));
+        let version_err = grpc_status_error(version, "AppendStream");
+        assert!(
+            version_err
+                .to_string()
+                .contains("EXPECTED_VERSION_CONFLICT")
+                && version_err.to_string().contains("not retrying"),
+            "{version_err}"
+        );
+
+        let condition = status_with_reason(tonic::Code::Aborted, "CONDITION_CONFLICT", &[]);
+        assert_eq!(
+            slingshot_failure(&condition),
+            Some(SlingshotFailure::Conflict {
+                reason: "CONDITION_CONFLICT".into(),
+            })
+        );
+        assert!(!slingshot_failure(&condition).unwrap().retryable());
+        let condition_err = grpc_status_error(condition, "AppendDcb");
+        assert!(
+            condition_err.to_string().contains("CONDITION_CONFLICT")
+                && condition_err.to_string().contains("not retrying"),
+            "{condition_err}"
+        );
+
+        let aborted = tonic::Status::new(tonic::Code::Aborted, "conflict");
+        assert_eq!(
+            slingshot_failure(&aborted),
+            Some(SlingshotFailure::Conflict {
+                reason: String::new(),
+            })
+        );
+        assert!(!grpc_status_retryable(&aborted));
+
+        let precondition = tonic::Status::new(tonic::Code::FailedPrecondition, "unknown");
+        assert!(slingshot_failure(&precondition).is_none());
+        assert!(!grpc_status_retryable(&precondition));
+    }
+
+    #[test]
+    fn unrelated_status_is_not_a_slingshot_failure() {
+        let unavailable = tonic::Status::unavailable("upstream reset");
+        assert!(slingshot_failure(&unavailable).is_none());
+        assert!(grpc_status_retryable(&unavailable));
+        let err = grpc_status_error(unavailable, "ReadByQuery");
+        assert!(err.to_string().contains("upstream reset"));
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("leader_endpoint".into(), "http://other:1".into());
+        let foreign = tonic::Status::with_error_details(
+            tonic::Code::Unavailable,
+            "NOT_LEADER",
+            tonic_types::ErrorDetails::with_error_info("NOT_LEADER", "other.domain", metadata),
+        );
+        assert!(slingshot_failure(&foreign).is_none());
+        assert!(grpc_status_retryable(&foreign));
+    }
 }
-
-
