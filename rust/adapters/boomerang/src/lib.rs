@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic_types::StatusExt;
 
@@ -128,6 +131,10 @@ impl StoreManager for BoomerangStoreManager {
     }
 
     async fn start(&mut self) -> Result<()> {
+        // wait_for_ready discards the underlying error, so an illegal
+        // SLINGSHOT_CONTEXT must fail here — before Docker and before dialing.
+        let _ = SlingshotContextInterceptor::from_env()?;
+
         if self.use_docker {
             let mount_path = self.data_dir.setup()?;
             #[cfg_attr(not(unix), allow(unused_variables))]
@@ -242,7 +249,72 @@ impl StoreManager for BoomerangStoreManager {
     }
 }
 
-async fn connect_client(uri: &str) -> Result<EventStoreServiceClient<Channel>> {
+const SLINGSHOT_CONTEXT_HEADER: &str = "x-slingshot-context";
+const DEFAULT_SLINGSHOT_CONTEXT: &str = "default";
+
+/// Every client is this type. The interceptor sits on the channel, so unary
+/// calls, streaming reads, subscribe, and calls after the channel reconnects
+/// all send `x-slingshot-context`.
+type BoomerangClient =
+    EventStoreServiceClient<InterceptedService<Channel, SlingshotContextInterceptor>>;
+
+/// Adds `x-slingshot-context` from `SLINGSHOT_CONTEXT` (default `default`).
+/// Built once per client after the value is checked at startup.
+#[derive(Clone, Debug)]
+struct SlingshotContextInterceptor {
+    value: MetadataValue<Ascii>,
+}
+
+impl SlingshotContextInterceptor {
+    fn from_env() -> Result<Self> {
+        Self::parse(&slingshot_context_from_env()?)
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        if !is_legal_ascii_header_value(raw) {
+            anyhow::bail!(
+                "SLINGSHOT_CONTEXT is not a legal ASCII header value (got {raw:?}); expected one or more printable ASCII characters (bytes 0x20-0x7E)"
+            );
+        }
+        let value = raw.parse::<MetadataValue<Ascii>>().map_err(|err| {
+            anyhow::anyhow!(
+                "SLINGSHOT_CONTEXT is not a legal ASCII header value (got {raw:?}): {err}"
+            )
+        })?;
+        Ok(Self { value })
+    }
+}
+
+fn slingshot_context_from_env() -> Result<String> {
+    match std::env::var("SLINGSHOT_CONTEXT") {
+        Ok(value) => Ok(value),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_SLINGSHOT_CONTEXT.to_string()),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "SLINGSHOT_CONTEXT is not a legal ASCII header value: the environment value is not valid Unicode; expected one or more printable ASCII characters (bytes 0x20-0x7E)"
+        ),
+    }
+}
+
+/// gRPC ASCII metadata: one or more bytes in `%x20-7E` (space through `~`).
+fn is_legal_ascii_header_value(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+}
+
+impl Interceptor for SlingshotContextInterceptor {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        request
+            .metadata_mut()
+            .insert(SLINGSHOT_CONTEXT_HEADER, self.value.clone());
+        Ok(request)
+    }
+}
+
+async fn connect_client(uri: &str) -> Result<BoomerangClient> {
+    // Validate before dialing so a bad header fails startup instead of the RPC.
+    let interceptor = SlingshotContextInterceptor::from_env()?;
     let endpoint = Endpoint::from_shared(uri.to_string())?
         .tcp_nodelay(true)
         .http2_keep_alive_interval(Duration::from_secs(5))
@@ -250,11 +322,14 @@ async fn connect_client(uri: &str) -> Result<EventStoreServiceClient<Channel>> {
         .initial_stream_window_size(Some(4 * 1024 * 1024))
         .initial_connection_window_size(Some(8 * 1024 * 1024));
     let channel = endpoint.connect().await?;
-    Ok(EventStoreServiceClient::new(channel))
+    Ok(EventStoreServiceClient::with_interceptor(
+        channel,
+        interceptor,
+    ))
 }
 
 pub struct BoomerangAdapter {
-    client: EventStoreServiceClient<Channel>,
+    client: BoomerangClient,
 }
 
 impl BoomerangAdapter {
@@ -1477,5 +1552,174 @@ mod tests {
         );
         assert!(slingshot_failure(&foreign).is_none());
         assert!(grpc_status_retryable(&foreign));
+    }
+
+    fn slingshot_context_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        &LOCK
+    }
+
+    struct SlingshotContextEnv {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl SlingshotContextEnv {
+        fn replace(value: Option<std::ffi::OsString>) -> Self {
+            let prev = std::env::var_os("SLINGSHOT_CONTEXT");
+            // SAFETY: tests that mutate SLINGSHOT_CONTEXT hold slingshot_context_env_lock.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var("SLINGSHOT_CONTEXT", value),
+                    None => std::env::remove_var("SLINGSHOT_CONTEXT"),
+                }
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for SlingshotContextEnv {
+        fn drop(&mut self) {
+            // SAFETY: the matching replace() call still holds slingshot_context_env_lock.
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var("SLINGSHOT_CONTEXT", value),
+                    None => std::env::remove_var("SLINGSHOT_CONTEXT"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slingshot_context_header_present_on_each_call() {
+        let interceptor = SlingshotContextInterceptor::parse("tenant-a").unwrap();
+        // Clone stands in for `client.clone()` on unary, stream, and subscribe.
+        let mut calls = [interceptor.clone(), interceptor];
+        for interceptor in &mut calls {
+            let mut request = tonic::Request::new(());
+            request
+                .metadata_mut()
+                .insert("x-request-id", "req".parse().unwrap());
+            let request = interceptor.call(request).unwrap();
+            assert_eq!(
+                request
+                    .metadata()
+                    .get(SLINGSHOT_CONTEXT_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("tenant-a"),
+                "x-slingshot-context must be set on every call"
+            );
+            assert_eq!(
+                request
+                    .metadata()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("req")
+            );
+        }
+    }
+
+    #[test]
+    fn slingshot_context_defaults_when_env_unset() {
+        let _lock = slingshot_context_env_lock().blocking_lock();
+        let _env = SlingshotContextEnv::replace(None);
+        let interceptor = SlingshotContextInterceptor::from_env().unwrap();
+        let request = interceptor.clone().call(tonic::Request::new(())).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get(SLINGSHOT_CONTEXT_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(DEFAULT_SLINGSHOT_CONTEXT)
+        );
+    }
+
+    #[test]
+    fn slingshot_context_env_override() {
+        let _lock = slingshot_context_env_lock().blocking_lock();
+        let _env = SlingshotContextEnv::replace(Some("bench-tenant".into()));
+        let mut interceptor = SlingshotContextInterceptor::from_env().unwrap();
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get(SLINGSHOT_CONTEXT_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("bench-tenant")
+        );
+    }
+
+    #[test]
+    fn slingshot_context_invalid_value_rejected() {
+        let _lock = slingshot_context_env_lock().blocking_lock();
+        let invalid = [
+            "",
+            "bad\nvalue",
+            "bad\rvalue",
+            "bad\tvalue",
+            "has\u{7f}del",
+            "café",
+        ];
+        for value in invalid {
+            let _env = SlingshotContextEnv::replace(Some(value.into()));
+            let err = SlingshotContextInterceptor::from_env().expect_err(value);
+            let message = err.to_string();
+            assert!(
+                message.contains("SLINGSHOT_CONTEXT")
+                    && message.contains("not a legal ASCII header value"),
+                "{value:?} => {message}"
+            );
+            assert!(
+                SlingshotContextInterceptor::parse(value).is_err(),
+                "{value:?} must be rejected"
+            );
+        }
+
+        let _env = SlingshotContextEnv::replace(None);
+        assert!(SlingshotContextInterceptor::parse("default").is_ok());
+        assert!(SlingshotContextInterceptor::parse("A Z_1.").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slingshot_context_non_unicode_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _lock = slingshot_context_env_lock().blocking_lock();
+        let _env = SlingshotContextEnv::replace(Some(std::ffi::OsString::from_vec(vec![0xff])));
+        let err = SlingshotContextInterceptor::from_env().expect_err("non-unicode");
+        let message = err.to_string();
+        assert!(
+            message.contains("SLINGSHOT_CONTEXT")
+                && message.contains("not a legal ASCII header value")
+                && message.contains("not valid Unicode"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_invalid_context_before_dial() {
+        let _lock = slingshot_context_env_lock().lock().await;
+        let _env = SlingshotContextEnv::replace(Some("nope\n".into()));
+
+        let mut manager = BoomerangStoreManager::fsync(None, false);
+        let err = manager.start().await.expect_err("start");
+        assert!(
+            err.to_string().contains("not a legal ASCII header value"),
+            "{err}"
+        );
+
+        // TEST-NET. Reaching connect() would block; validation must return first.
+        let dial = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_client("http://192.0.2.1:81"),
+        )
+        .await;
+        let err = dial
+            .expect("invalid SLINGSHOT_CONTEXT must fail before dialing")
+            .expect_err("connect");
+        assert!(
+            err.to_string().contains("not a legal ASCII header value"),
+            "{err}"
+        );
     }
 }
