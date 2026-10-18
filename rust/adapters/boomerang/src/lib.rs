@@ -349,6 +349,8 @@ impl BoomerangAdapter {
             condition_json: Self::condition_json(condition),
             metadata_json: Self::metadata_json(events),
             tags: Self::batch_tags(events),
+            // Empty default. The server ignores request_id today.
+            request_id: String::new(),
         };
         let mut client = self.client.clone();
         let response = client.append_dcb(request).await?.into_inner();
@@ -386,6 +388,8 @@ impl BoomerangAdapter {
             expected_version: Self::expected_version(stream_position),
             metadata_json: Self::metadata_json(events),
             tags: Self::batch_tags(events),
+            // Empty default. The server ignores request_id today.
+            request_id: String::new(),
         };
         let mut client = self.client.clone();
         let response = client.append_stream(request).await?.into_inner();
