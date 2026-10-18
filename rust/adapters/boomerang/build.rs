@@ -13,7 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={proto_file}");
 
     tonic_prost_build::configure()
-        .build_server(false)
+        // Server stubs let unit tests host an in-process EventStoreService.
+        .build_server(true)
         .compile_protos(&[&proto_file], &[&proto_root])?;
     Ok(())
 }

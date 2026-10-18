@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic_types::StatusExt;
 
@@ -128,6 +131,10 @@ impl StoreManager for BoomerangStoreManager {
     }
 
     async fn start(&mut self) -> Result<()> {
+        // wait_for_ready discards the underlying error, so an illegal
+        // SLINGSHOT_CONTEXT must fail here — before Docker and before dialing.
+        let _ = slingshot_context_from_env()?;
+
         if self.use_docker {
             let mount_path = self.data_dir.setup()?;
             #[cfg_attr(not(unix), allow(unused_variables))]
@@ -242,7 +249,98 @@ impl StoreManager for BoomerangStoreManager {
     }
 }
 
-async fn connect_client(uri: &str) -> Result<EventStoreServiceClient<Channel>> {
+const SLINGSHOT_CONTEXT_HEADER: &str = "x-slingshot-context";
+const DEFAULT_SLINGSHOT_CONTEXT: &str = "default";
+
+/// Every client is this type. The interceptor sits on the channel, so unary
+/// calls, streaming reads, subscribe, and calls after the channel reconnects
+/// all send `x-slingshot-context`.
+type BoomerangClient =
+    EventStoreServiceClient<InterceptedService<Channel, SlingshotContextInterceptor>>;
+
+/// Adds `x-slingshot-context` from `SLINGSHOT_CONTEXT` (default `default`).
+/// Built once per client after the value is checked at startup.
+#[derive(Clone, Debug)]
+struct SlingshotContextInterceptor {
+    value: MetadataValue<Ascii>,
+}
+
+impl SlingshotContextInterceptor {
+    fn parse(raw: &str) -> Result<Self> {
+        if let Some(reason) = illegal_slingshot_context(raw) {
+            anyhow::bail!(
+                "SLINGSHOT_CONTEXT is not a legal ASCII header value (got {raw:?}): {reason}"
+            );
+        }
+        let value = raw.parse::<MetadataValue<Ascii>>().map_err(|err| {
+            anyhow::anyhow!(
+                "SLINGSHOT_CONTEXT is not a legal ASCII header value (got {raw:?}): {err}"
+            )
+        })?;
+        Ok(Self { value })
+    }
+}
+
+/// `None` means `SLINGSHOT_CONTEXT` is unset, which selects `default`.
+fn resolve_slingshot_context(value: Option<&str>) -> Result<SlingshotContextInterceptor> {
+    SlingshotContextInterceptor::parse(value.unwrap_or(DEFAULT_SLINGSHOT_CONTEXT))
+}
+
+/// Env read for `resolve_slingshot_context`. Callers pass the `std::env::var` result.
+fn slingshot_context_from_var(
+    var: std::result::Result<String, std::env::VarError>,
+) -> Result<SlingshotContextInterceptor> {
+    match var {
+        Ok(value) => resolve_slingshot_context(Some(&value)),
+        Err(std::env::VarError::NotPresent) => resolve_slingshot_context(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "SLINGSHOT_CONTEXT is not a legal ASCII header value: the environment value is not valid Unicode; expected one or more printable ASCII characters (bytes 0x20-0x7E) with no leading or trailing whitespace"
+        ),
+    }
+}
+
+fn slingshot_context_from_env() -> Result<SlingshotContextInterceptor> {
+    slingshot_context_from_var(std::env::var("SLINGSHOT_CONTEXT"))
+}
+
+/// Printable ASCII (`0x20`–`0x7E`), non-empty, with no leading or trailing whitespace.
+fn illegal_slingshot_context(value: &str) -> Option<&'static str> {
+    if value != value.trim() {
+        return Some("leading or trailing whitespace is not allowed");
+    }
+    if value.is_empty() || value.bytes().any(|byte| !(0x20..=0x7e).contains(&byte)) {
+        return Some(
+            "expected one or more printable ASCII characters (bytes 0x20-0x7E) with no leading or trailing whitespace",
+        );
+    }
+    None
+}
+
+impl Interceptor for SlingshotContextInterceptor {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        request
+            .metadata_mut()
+            .insert(SLINGSHOT_CONTEXT_HEADER, self.value.clone());
+        Ok(request)
+    }
+}
+
+async fn connect_client(uri: &str) -> Result<BoomerangClient> {
+    connect_with_interceptor(uri, slingshot_context_from_env()?).await
+}
+
+#[cfg(test)]
+async fn connect_client_with(uri: &str, context: Option<&str>) -> Result<BoomerangClient> {
+    connect_with_interceptor(uri, resolve_slingshot_context(context)?).await
+}
+
+async fn connect_with_interceptor(
+    uri: &str,
+    interceptor: SlingshotContextInterceptor,
+) -> Result<BoomerangClient> {
     let endpoint = Endpoint::from_shared(uri.to_string())?
         .tcp_nodelay(true)
         .http2_keep_alive_interval(Duration::from_secs(5))
@@ -250,11 +348,14 @@ async fn connect_client(uri: &str) -> Result<EventStoreServiceClient<Channel>> {
         .initial_stream_window_size(Some(4 * 1024 * 1024))
         .initial_connection_window_size(Some(8 * 1024 * 1024));
     let channel = endpoint.connect().await?;
-    Ok(EventStoreServiceClient::new(channel))
+    Ok(EventStoreServiceClient::with_interceptor(
+        channel,
+        interceptor,
+    ))
 }
 
 pub struct BoomerangAdapter {
-    client: EventStoreServiceClient<Channel>,
+    client: BoomerangClient,
 }
 
 impl BoomerangAdapter {
@@ -1477,5 +1578,345 @@ mod tests {
         );
         assert!(slingshot_failure(&foreign).is_none());
         assert!(grpc_status_retryable(&foreign));
+    }
+
+    fn context_header(request: &tonic::Request<()>) -> &str {
+        request
+            .metadata()
+            .get(SLINGSHOT_CONTEXT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("x-slingshot-context")
+    }
+
+    #[test]
+    fn slingshot_context_header_present_on_each_call() {
+        let interceptor = resolve_slingshot_context(Some("tenant-a")).unwrap();
+        // Clone stands in for `client.clone()` on unary, stream, and subscribe.
+        let mut calls = [interceptor.clone(), interceptor];
+        for interceptor in &mut calls {
+            let mut request = tonic::Request::new(());
+            request
+                .metadata_mut()
+                .insert("x-request-id", "req".parse().unwrap());
+            let request = interceptor.call(request).unwrap();
+            assert_eq!(context_header(&request), "tenant-a");
+            assert_eq!(
+                request
+                    .metadata()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("req")
+            );
+        }
+    }
+
+    #[test]
+    fn slingshot_context_defaults_when_unset() {
+        for interceptor in [
+            resolve_slingshot_context(None).unwrap(),
+            slingshot_context_from_var(Err(std::env::VarError::NotPresent)).unwrap(),
+        ] {
+            let request = interceptor.clone().call(tonic::Request::new(())).unwrap();
+            assert_eq!(context_header(&request), DEFAULT_SLINGSHOT_CONTEXT);
+        }
+    }
+
+    #[test]
+    fn slingshot_context_value_override() {
+        for interceptor in [
+            resolve_slingshot_context(Some("bench-tenant")).unwrap(),
+            slingshot_context_from_var(Ok("bench-tenant".to_string())).unwrap(),
+        ] {
+            let mut interceptor = interceptor;
+            let request = interceptor.call(tonic::Request::new(())).unwrap();
+            assert_eq!(context_header(&request), "bench-tenant");
+        }
+    }
+
+    #[test]
+    fn slingshot_context_invalid_value_rejected() {
+        for value in [
+            "",
+            "bad\nvalue",
+            "bad\rvalue",
+            "bad\tvalue",
+            "has\u{7f}del",
+            "café",
+        ] {
+            let err = resolve_slingshot_context(Some(value)).expect_err(value);
+            let message = err.to_string();
+            assert!(
+                message.contains("SLINGSHOT_CONTEXT")
+                    && message.contains("not a legal ASCII header value"),
+                "{value:?} => {message}"
+            );
+        }
+
+        assert!(resolve_slingshot_context(Some("default")).is_ok());
+        assert!(resolve_slingshot_context(Some("A Z_1.")).is_ok());
+    }
+
+    #[test]
+    fn slingshot_context_rejects_leading_or_trailing_whitespace() {
+        for value in [
+            " default",
+            "default ",
+            " default ",
+            " ",
+            "\tdefault",
+            "default\n",
+        ] {
+            let err = resolve_slingshot_context(Some(value)).expect_err(value);
+            let message = err.to_string();
+            assert!(
+                message.contains("SLINGSHOT_CONTEXT")
+                    && message.contains("leading or trailing whitespace"),
+                "{value:?} => {message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slingshot_context_non_unicode_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let err = slingshot_context_from_var(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from_vec(vec![0xff]),
+        )))
+        .expect_err("non-unicode");
+        let message = err.to_string();
+        assert!(
+            message.contains("SLINGSHOT_CONTEXT")
+                && message.contains("not a legal ASCII header value")
+                && message.contains("not valid Unicode"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_invalid_context_before_dial() {
+        // The error text is the header check, and the call finishes within 2s.
+        // That does not prove the address would have blocked.
+        let dial = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_client_with("http://192.0.2.1:81", Some("nope\n")),
+        )
+        .await;
+        let err = dial
+            .expect("invalid context returned within 2s")
+            .expect_err("invalid context");
+        assert!(
+            err.to_string().contains("not a legal ASCII header value"),
+            "{err}"
+        );
+    }
+
+    #[derive(Clone)]
+    struct RecordingStore {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedCall>>>,
+    }
+
+    struct RecordedCall {
+        rpc: &'static str,
+        context: Option<String>,
+    }
+
+    impl RecordingStore {
+        fn record(&self, rpc: &'static str, metadata: &tonic::metadata::MetadataMap) {
+            let context = metadata
+                .get(SLINGSHOT_CONTEXT_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            self.calls
+                .lock()
+                .expect("recording")
+                .push(RecordedCall { rpc, context });
+        }
+    }
+
+    struct EmptyEvents;
+
+    impl tonic::codegen::tokio_stream::Stream for EmptyEvents {
+        type Item = std::result::Result<SequencedEventProto, tonic::Status>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl proto::event_store_service_server::EventStoreService for RecordingStore {
+        async fn append_stream(
+            &self,
+            _request: tonic::Request<AppendStreamRequest>,
+        ) -> std::result::Result<tonic::Response<proto::AppendResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn append_dcb(
+            &self,
+            _request: tonic::Request<AppendDcbRequest>,
+        ) -> std::result::Result<tonic::Response<proto::AppendResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn read_stream(
+            &self,
+            _request: tonic::Request<ReadStreamRequest>,
+        ) -> std::result::Result<tonic::Response<proto::ReadStreamResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        type ReadStreamEnumerableStream = EmptyEvents;
+
+        async fn read_stream_enumerable(
+            &self,
+            _request: tonic::Request<ReadStreamRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ReadStreamEnumerableStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn read_by_query(
+            &self,
+            _request: tonic::Request<ReadByQueryRequest>,
+        ) -> std::result::Result<tonic::Response<proto::ReadByQueryResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        type ReadByQueryStreamStream = EmptyEvents;
+
+        async fn read_by_query_stream(
+            &self,
+            request: tonic::Request<ReadByQueryStreamRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ReadByQueryStreamStream>, tonic::Status>
+        {
+            self.record("ReadByQueryStream", request.metadata());
+            Ok(tonic::Response::new(EmptyEvents))
+        }
+
+        type SubscribeStream = EmptyEvents;
+
+        async fn subscribe(
+            &self,
+            _request: tonic::Request<SubscribeRequest>,
+        ) -> std::result::Result<tonic::Response<Self::SubscribeStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_current_sequence(
+            &self,
+            request: tonic::Request<GetCurrentSequenceRequest>,
+        ) -> std::result::Result<tonic::Response<proto::GetCurrentSequenceResponse>, tonic::Status>
+        {
+            self.record("GetCurrentSequence", request.metadata());
+            Ok(tonic::Response::new(proto::GetCurrentSequenceResponse {
+                current_sequence: 0,
+                ..Default::default()
+            }))
+        }
+
+        async fn get_stream(
+            &self,
+            _request: tonic::Request<proto::GetStreamRequest>,
+        ) -> std::result::Result<tonic::Response<proto::GetStreamResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_streams_by_aggregate_type(
+            &self,
+            _request: tonic::Request<proto::GetStreamsByAggregateTypeRequest>,
+        ) -> std::result::Result<tonic::Response<proto::StreamListResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_streams_by_tag(
+            &self,
+            _request: tonic::Request<proto::GetStreamsByTagRequest>,
+        ) -> std::result::Result<tonic::Response<proto::StreamListResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn enumerate_stream_ids(
+            &self,
+            _request: tonic::Request<proto::EnumerateStreamIdsRequest>,
+        ) -> std::result::Result<tonic::Response<proto::StreamIdsResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_stream_count(
+            &self,
+            _request: tonic::Request<proto::GetStreamCountRequest>,
+        ) -> std::result::Result<tonic::Response<proto::GetStreamCountResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_streams_updated_after(
+            &self,
+            _request: tonic::Request<proto::GetStreamsUpdatedAfterRequest>,
+        ) -> std::result::Result<tonic::Response<proto::StreamListResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+    }
+
+    #[tokio::test]
+    async fn slingshot_context_header_reaches_unary_and_streaming_calls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = RecordingStore {
+            calls: std::sync::Arc::clone(&calls),
+        };
+        let incoming = tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(proto::event_store_service_server::EventStoreServiceServer::new(store))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let mut interceptor = slingshot_context_from_env().expect("SLINGSHOT_CONTEXT");
+        let expected_request = interceptor.call(tonic::Request::new(())).unwrap();
+        let expected = context_header(&expected_request).to_string();
+
+        let mut client: BoomerangClient = connect_client(&format!("http://{addr}")).await.unwrap();
+        client
+            .get_current_sequence(GetCurrentSequenceRequest {
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut stream = client
+            .read_by_query_stream(ReadByQueryStreamRequest {
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().is_none());
+
+        let calls = calls.lock().expect("recording");
+        for rpc in ["GetCurrentSequence", "ReadByQueryStream"] {
+            let call = calls
+                .iter()
+                .find(|call| call.rpc == rpc)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{rpc} was not recorded; saw {:?}",
+                        calls.iter().map(|call| call.rpc).collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(call.context.as_deref(), Some(expected.as_str()), "{rpc}");
+        }
     }
 }
