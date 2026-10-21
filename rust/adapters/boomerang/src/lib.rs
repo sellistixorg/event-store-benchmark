@@ -611,10 +611,26 @@ impl BoomerangAdapter {
             })
     }
 
-    /// Absent when the harness does not ask for a version check. `Some(0)` is
-    /// version 0; the old `-1` sentinel is not sent.
+    /// Optimistic stream version for `AppendStream`.
+    ///
+    /// `None` is an unconditional append. The field is omitted, which means no check.
+    ///
+    /// When concurrency control is on, the harness starts a stream at position 0
+    /// and adds 1 after each successful append. Those appends are one event
+    /// (`batch_size` defaults to 1), so after N events the next harness position
+    /// is N. Slingshot versions are 1-based: the first event is version 1, and
+    /// the stream version after N events is N. For N >= 1 those numbers match,
+    /// so the expected version is N.
+    ///
+    /// Position 0 is the new stream. A missing stream's version is -1, and -1
+    /// means the stream must not exist. 0 is a real version and conflicts on a
+    /// new stream, so it is not sent.
     fn expected_version(stream_position: Option<usize>) -> Option<i64> {
-        stream_position.map(|position| position as i64)
+        match stream_position {
+            None => None,
+            Some(0) => Some(-1),
+            Some(position) => Some(position as i64),
+        }
     }
 
     async fn append_stream_batch(
@@ -1121,7 +1137,8 @@ mod tests {
             "tag1"
         );
         assert_eq!(BoomerangAdapter::expected_version(None), None);
-        assert_eq!(BoomerangAdapter::expected_version(Some(0)), Some(0));
+        assert_eq!(BoomerangAdapter::expected_version(Some(0)), Some(-1));
+        assert_eq!(BoomerangAdapter::expected_version(Some(1)), Some(1));
         assert_eq!(BoomerangAdapter::expected_version(Some(9)), Some(9));
         let empty = EventData {
             payload: Arc::from(vec![1u8]),
@@ -1130,6 +1147,42 @@ mod tests {
             metadata: Arc::from([]),
         };
         assert!(BoomerangAdapter::stream_id_from_events(&[empty]).is_err());
+    }
+
+    /// Harness position 0 is a new stream. After each one-event append the
+    /// harness adds 1, and the store's version is that same count.
+    #[test]
+    fn expected_version_maps_new_stream_to_minus_one() {
+        let event = EventData {
+            payload: Arc::from(vec![1u8]),
+            event_type: Arc::from("t"),
+            tags: Arc::from([Arc::from("stream-a")]),
+            metadata: Arc::from([]),
+        };
+
+        assert_eq!(BoomerangAdapter::expected_version(None), None);
+        let unconditional =
+            BoomerangAdapter::append_stream_request(std::slice::from_ref(&event), None).unwrap();
+        assert!(unconditional.expected_version.is_none());
+
+        assert_eq!(BoomerangAdapter::expected_version(Some(0)), Some(-1));
+        let created =
+            BoomerangAdapter::append_stream_request(std::slice::from_ref(&event), Some(0)).unwrap();
+        assert_eq!(created.expected_version, Some(-1));
+
+        // After the first event the stream version is 1. The next harness
+        // position is 1, so the expected version is 1, not 0.
+        assert_eq!(BoomerangAdapter::expected_version(Some(1)), Some(1));
+        let second =
+            BoomerangAdapter::append_stream_request(std::slice::from_ref(&event), Some(1)).unwrap();
+        assert_eq!(second.expected_version, Some(1));
+
+        // After N events the version is N.
+        assert_eq!(BoomerangAdapter::expected_version(Some(2)), Some(2));
+        assert_eq!(BoomerangAdapter::expected_version(Some(9)), Some(9));
+        let tenth =
+            BoomerangAdapter::append_stream_request(std::slice::from_ref(&event), Some(9)).unwrap();
+        assert_eq!(tenth.expected_version, Some(9));
     }
 
     #[tokio::test]
@@ -1318,7 +1371,7 @@ mod tests {
         let conflict = adapter.append_to_stream(&[evt], Some(0), None).await;
         assert!(
             conflict.is_err(),
-            "expected version 0 must conflict after the stream is at version 1"
+            "position 0 means the stream must not exist, so it conflicts once the stream is at version 1"
         );
 
         manager.stop().await?;
@@ -1403,7 +1456,7 @@ mod tests {
         assert!(append.events[0].schema_version.is_none());
 
         let checked = BoomerangAdapter::append_stream_request(&[bare], Some(0)).unwrap();
-        assert_eq!(checked.expected_version, Some(0));
+        assert_eq!(checked.expected_version, Some(-1));
 
         let by_id = BoomerangAdapter::read_stream_request("stream-a", None);
         assert_eq!(by_id.from_version, 0);
