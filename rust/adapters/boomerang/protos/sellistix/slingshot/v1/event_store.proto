@@ -1,7 +1,8 @@
-
 syntax = "proto3";
 
 package sellistix.slingshot.v1;
+
+import "google/protobuf/timestamp.proto";
 
 option csharp_namespace = "Sellistix.Slingshot.Protos.V1";
 
@@ -12,28 +13,28 @@ option csharp_namespace = "Sellistix.Slingshot.Protos.V1";
 // ─────────────────────────────────────────────────────────────────────────────
 service EventStoreService {
   // ── Writes ──────────────────────────────────────────────────────────────
-  rpc AppendStream    (AppendStreamRequest)    returns (AppendResponse);
-  rpc AppendDcb       (AppendDcbRequest)       returns (AppendResponse);
+  rpc AppendStream    (AppendStreamRequest)    returns (AppendStreamResponse);
+  rpc AppendDcb       (AppendDcbRequest)       returns (AppendDcbResponse);
 
   // ── Reads ────────────────────────────────────────────────────────────────
-  rpc ReadStream          (ReadStreamRequest)         returns (ReadStreamResponse);
-  rpc ReadStreamEnumerable(ReadStreamRequest)         returns (stream SequencedEventProto);
-  rpc ReadByQuery         (ReadByQueryRequest)        returns (ReadByQueryResponse);
-  rpc ReadByQueryStream   (ReadByQueryStreamRequest)  returns (stream SequencedEventProto);
+  rpc ReadStream          (ReadStreamRequest)          returns (ReadStreamResponse);
+  rpc ReadStreamEnumerable(ReadStreamEnumerableRequest) returns (stream ReadStreamEnumerableResponse);
+  rpc ReadByQuery         (ReadByQueryRequest)         returns (ReadByQueryResponse);
+  rpc ReadByQueryStream   (ReadByQueryStreamRequest)   returns (stream ReadByQueryStreamResponse);
 
   // ── Portable subscriptions (Pack D P4 — public log-tail; NOT Raft peer replication) ──
   // from_sequence_position is inclusive. Catch-up → live is transparent (no phase field).
   // Client-owned cursor: reconnect with lastApplied + 1. At-least-once delivery.
-  rpc Subscribe           (SubscribeRequest)          returns (stream SequencedEventProto);
+  rpc Subscribe           (SubscribeRequest)          returns (stream SubscribeResponse);
   rpc GetCurrentSequence  (GetCurrentSequenceRequest) returns (GetCurrentSequenceResponse);
 
   // ── Registry ─────────────────────────────────────────────────────────────
   rpc GetStream                  (GetStreamRequest)               returns (GetStreamResponse);
-  rpc GetStreamsByAggregateType  (GetStreamsByAggregateTypeRequest) returns (StreamListResponse);
-  rpc GetStreamsByTag            (GetStreamsByTagRequest)          returns (StreamListResponse);
-  rpc EnumerateStreamIds         (EnumerateStreamIdsRequest)       returns (StreamIdsResponse);
+  rpc GetStreamsByAggregateType  (GetStreamsByAggregateTypeRequest) returns (GetStreamsByAggregateTypeResponse);
+  rpc GetStreamsByTag            (GetStreamsByTagRequest)          returns (GetStreamsByTagResponse);
+  rpc EnumerateStreamIds         (EnumerateStreamIdsRequest)       returns (EnumerateStreamIdsResponse);
   rpc GetStreamCount             (GetStreamCountRequest)           returns (GetStreamCountResponse);
-  rpc GetStreamsUpdatedAfter      (GetStreamsUpdatedAfterRequest)   returns (StreamListResponse);
+  rpc GetStreamsUpdatedAfter      (GetStreamsUpdatedAfterRequest)   returns (GetStreamsUpdatedAfterResponse);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -43,11 +44,80 @@ message SerializedEventProto {
   string type_name      = 1;  // Catalog family token, not a CLR FullName
   bytes  payload        = 2;  // Opaque event payload bytes (codec named by codec_id)
   reserved 3;                 // was string content_type — do not reuse (K11)
-  int32  schema_version = 4;  // First-class family version as stamped by the writer
+  // Absent means the frame version is 1, the same as a missing or zero version
+  // on an older row. A present value, including 0 or a negative number, is a
+  // different value on the wire.
+  optional int32 schema_version = 4;
   // Codec id (K4): 1 JSON · 2 MemoryPack · 3 Avro · 4 Protobuf.
   // 1–63 LawnDart-reserved. 64–254 user-registered. 255 opaque / unspecified bytes.
   // 0 is never valid on a durable frame.
   uint32 codec_id       = 5;
+}
+
+// LawnDart EventMetadata, one field per public property. Absent means the
+// sender did not set the property. The server does not fill event_id,
+// timestamp, or schema_version when they are absent.
+message EventMetadata {
+  optional string user_id = 1;
+  optional string user_name = 2;
+  optional string tenant_id = 3;
+  optional string account_id = 4;
+  optional string ip_address = 5;
+  optional string user_agent = 6;
+  optional string correlation_id = 7;
+  optional string causation_id = 8;
+  optional string event_id = 9;
+  optional string authorized_by = 10;
+  optional google.protobuf.Timestamp authorized_at = 11;
+  // Null and empty are the same in LawnDart: both mean no policies. An empty
+  // list is how both are sent.
+  repeated string authorization_policies = 12;
+  optional google.protobuf.Timestamp timestamp = 13;
+  optional google.protobuf.Timestamp commit_timestamp = 14;
+  optional int32 schema_version = 15;
+  optional string schema_name = 16;
+  // An empty map and a missing map are the same. LawnDart's dictionary is
+  // never null.
+  map<string, string> custom = 17;
+  optional string trace_id = 18;
+  optional string span_id = 19;
+}
+
+// LawnDart PartitionFilter. Present only when the query item sets one.
+// Node instance 0 is a real instance, not "unset".
+message PartitionFilter {
+  int32 node_instance = 1;
+  int32 total_instances = 2;
+}
+
+// LawnDart QueryItem. Types and tags use the same rule: null and empty both
+// mean unrestricted, and both are sent as an empty list.
+message QueryItem {
+  repeated string types = 1;
+  repeated string tags = 2;
+  optional PartitionFilter partition_filter = 3;
+}
+
+// LawnDart Query. An empty item list matches every event (Query.All).
+message Query {
+  repeated QueryItem items = 1;
+}
+
+// LawnDart AppendCondition. fail_if_events_match is required. After and the
+// consistency marker are optional. An empty marker is present and is not the
+// same as an absent marker.
+message AppendCondition {
+  Query fail_if_events_match = 1;
+  optional int64 after = 2;
+  optional bytes consistency_marker = 3;
+}
+
+// LawnDart StreamStatus. Unspecified is not a stored status.
+enum StreamStatus {
+  STREAM_STATUS_UNSPECIFIED = 0;
+  STREAM_STATUS_ACTIVE = 1;
+  STREAM_STATUS_ARCHIVED = 2;
+  STREAM_STATUS_DELETED = 3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,20 +128,31 @@ message SequencedEventProto {
   int64                sequence_position = 2;
   string               stream_id         = 3;
   int64                version           = 4;
-  bytes                metadata_json     = 5;   // JSON-encoded EventMetadata
+  reserved 5;
+  reserved "metadata_json";
   repeated string      tags              = 6;
+  optional EventMetadata metadata        = 7;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shared: append result
+// Shared append result fields. Each call has its own response message.
 // ─────────────────────────────────────────────────────────────────────────────
-message AppendResponse {
-  repeated int64 sequence_positions  = 1;
-  bytes          consistency_marker  = 2;   // empty = not populated
-  int64          last_stream_version = 3;   // -1 = not populated
-  // Populated when this node is not the leader
-  bool           not_leader          = 4;
-  string         leader_endpoint     = 5;
+message AppendStreamResponse {
+  repeated int64 sequence_positions = 1;
+  // Absent means not populated. An empty byte string is populated.
+  optional bytes consistency_marker = 2;
+  // Absent means not populated. -1 is a real version.
+  optional int64 last_stream_version = 3;
+  reserved 4, 5;
+  reserved "not_leader", "leader_endpoint";
+}
+
+message AppendDcbResponse {
+  repeated int64 sequence_positions = 1;
+  optional bytes consistency_marker = 2;
+  optional int64 last_stream_version = 3;
+  reserved 4, 5;
+  reserved "not_leader", "leader_endpoint";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -80,10 +161,18 @@ message AppendResponse {
 message AppendStreamRequest {
   string                    stream_id        = 1;
   repeated SerializedEventProto events       = 2;
-  sint64                    expected_version = 3;   // -1 = no check
-  bytes                     metadata_json    = 4;
+  // Absent means no version check. -1 is a real expected version.
+  optional sint64           expected_version = 3;
+  reserved 4;
+  reserved "metadata_json";
   repeated string           tags             = 5;
-  string                    request_id       = 6;   // optional; empty = unset
+  // Reserved for a future client-generated idempotency key (see issue #6, do not
+  // freeze version 1 without it). Servers ignore this field today. An unchecked
+  // append that times out is not retried, because a second copy of the same
+  // events could commit. When deduplication exists, the leader will remember
+  // this id for a bounded window and return the original result on retry.
+  string                    request_id       = 6;
+  optional EventMetadata    metadata         = 7;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,10 +180,21 @@ message AppendStreamRequest {
 // ─────────────────────────────────────────────────────────────────────────────
 message AppendDcbRequest {
   repeated SerializedEventProto events         = 1;
-  bytes                         condition_json = 2;   // JSON-encoded AppendCondition
-  bytes                         metadata_json  = 3;
+  reserved 2;
+  reserved "condition_json";
+  reserved 3;
+  reserved "metadata_json";
   repeated string               tags           = 4;
-  string                        request_id     = 5;   // optional; empty = unset
+  // Reserved. Same meaning as AppendStreamRequest.request_id. Servers ignore it
+  // until leader-side deduplication is implemented.
+  string                        request_id     = 5;
+  // Optional tenant. When present, including empty, the server enforces it
+  // against EventMetadata.tenant_id or rejects the call. It is not copied
+  // into the metadata. Absent keeps the current append.
+  optional string               tenant_id      = 6;
+  // Required. An absent message is APPEND_CONDITION_REQUIRED.
+  AppendCondition               condition      = 7;
+  optional EventMetadata        metadata       = 8;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,53 +203,79 @@ message AppendDcbRequest {
 message ReadStreamRequest {
   string stream_id      = 1;
   int64  from_version   = 2;
-  sint64 to_version     = 3;   // -1 = no limit
-  int64  to_timestamp   = 4;   // UTC ticks, 0 = no limit
+  // Absent means no limit. -1 is a real version bound.
+  optional sint64 to_version = 3;
+  reserved 4;
+  reserved "to_timestamp";
+  // Business time limit (EventMetadata.timestamp). Absent means no limit.
+  optional google.protobuf.Timestamp to_time = 5;
+}
+
+message ReadStreamEnumerableRequest {
+  string stream_id      = 1;
+  int64  from_version   = 2;
+  optional sint64 to_version = 3;
+  reserved 4;
+  reserved "to_timestamp";
+  optional google.protobuf.Timestamp to_time = 5;
 }
 
 message ReadStreamResponse {
   repeated SequencedEventProto events = 1;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Query (native proto; JSON query_json remains a fallback)
-// ─────────────────────────────────────────────────────────────────────────────
-message QueryItemProto {
-  repeated string types = 1;
-  repeated string tags  = 2;
-}
-
-message QueryProto {
-  repeated QueryItemProto items = 1;
+// Stream item. The event is field 1 so later fields can be added beside it.
+message ReadStreamEnumerableResponse {
+  SequencedEventProto event = 1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ReadByQuery
 // ─────────────────────────────────────────────────────────────────────────────
 message ReadByQueryRequest {
-  bytes  query_json             = 1;   // JSON-encoded Query (fallback)
-  sint64 from_sequence_position = 2;   // -1 = from start
-  sint32 limit                  = 3;   // 0 = no limit
-  sint64 to_sequence_position   = 4;   // -1 = no limit
-  int64  to_timestamp           = 5;   // UTC ticks, 0 = no limit
-  QueryProto query              = 6;   // preferred when items are present
+  reserved 1;
+  reserved "query_json";
+  // Absent means from the start. -1 is a real position.
+  optional sint64 from_sequence_position = 2;
+  // Absent means no limit. 0 is a real limit.
+  optional sint32 limit                  = 3;
+  // Absent means no limit. -1 is a real position.
+  optional sint64 to_sequence_position   = 4;
+  reserved 5;
+  reserved "to_timestamp";
+  Query query                            = 6;
+  // Optional tenant. No tenant-scoped query exists yet. Present, including
+  // empty, is rejected. Absent keeps the current query.
+  optional string tenant_id              = 7;
+  // Business time limit. Absent means no limit.
+  optional google.protobuf.Timestamp to_time = 8;
 }
 
 message ReadByQueryResponse {
   repeated SequencedEventProto events             = 1;
-  bytes                        consistency_marker = 2;
+  optional bytes               consistency_marker = 2;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ReadByQueryStream
 // ─────────────────────────────────────────────────────────────────────────────
 message ReadByQueryStreamRequest {
-  bytes  query_json             = 1;   // JSON-encoded Query (fallback)
-  sint64 from_sequence_position = 2;
-  sint64 to_sequence_position   = 3;
-  int64  to_timestamp           = 4;
-  sint32 limit                  = 5;   // 0 = unbounded
-  QueryProto query              = 6;   // preferred when items are present
+  reserved 1;
+  reserved "query_json";
+  optional sint64 from_sequence_position = 2;
+  optional sint64 to_sequence_position   = 3;
+  reserved 4;
+  reserved "to_timestamp";
+  optional sint32 limit                  = 5;
+  Query query                            = 6;
+  // Optional tenant. No tenant-scoped query exists yet. Present, including
+  // empty, is rejected. Absent keeps the current query.
+  optional string tenant_id              = 7;
+  optional google.protobuf.Timestamp to_time = 8;
+}
+
+message ReadByQueryStreamResponse {
+  SequencedEventProto event = 1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -157,35 +283,63 @@ message ReadByQueryStreamRequest {
 // ─────────────────────────────────────────────────────────────────────────────
 message StreamMetadataProto {
   string          stream_id             = 1;
-  string          tenant_id             = 2;
+  // Absent means no tenant. An empty string is present.
+  optional string tenant_id             = 2;
   string          aggregate_type        = 3;
-  string          aggregate_id          = 4;   // Guid string, empty if not set
+  // Absent means no aggregate id. An empty string is present.
+  optional string aggregate_id          = 4;
   int64           current_version       = 5;
   int64           last_sequence_position = 6;
-  int64           created_at_ticks      = 7;   // UTC ticks
-  int64           last_event_at_ticks   = 8;
+  reserved 7, 8;
+  reserved "created_at_ticks", "last_event_at_ticks";
   int64           event_count           = 9;
   repeated string tags                  = 10;
-  string          status                = 11;  // "Active" | "Archived" | "Deleted"
+  reserved 11;
+  reserved "status";
+  StreamStatus    stream_status         = 12;
+  optional google.protobuf.Timestamp created_at = 13;
+  optional google.protobuf.Timestamp last_event_at = 14;
 }
 
-message GetStreamRequest         { string stream_id = 1; }
-message GetStreamResponse        { StreamMetadataProto stream = 1; bool found = 2; }
+message GetStreamRequest {
+  string stream_id = 1;
+  // Optional tenant. No tenant-scoped registry read exists yet. Present,
+  // including empty, is rejected. Absent keeps the current read.
+  optional string tenant_id = 2;
+}
+message GetStreamResponse        { optional StreamMetadataProto stream = 1; bool found = 2; }
 
-message GetStreamsByAggregateTypeRequest { string aggregate_type = 1; }
-message GetStreamsByTagRequest           { string tag = 1; }
-message StreamListResponse               { repeated StreamMetadataProto streams = 1; }
+message GetStreamsByAggregateTypeRequest {
+  string aggregate_type = 1;
+  optional string tenant_id = 2;
+}
+message GetStreamsByAggregateTypeResponse { repeated StreamMetadataProto streams = 1; }
 
-message EnumerateStreamIdsRequest  { string prefix = 1; }
-message StreamIdsResponse          { repeated string stream_ids = 1; }
+message GetStreamsByTagRequest {
+  string tag = 1;
+  optional string tenant_id = 2;
+}
+message GetStreamsByTagResponse { repeated StreamMetadataProto streams = 1; }
 
-message GetStreamCountRequest  { string prefix = 1; }  // empty = all streams
+message EnumerateStreamIdsRequest {
+  string prefix = 1;
+  optional string tenant_id = 2;
+}
+message EnumerateStreamIdsResponse { repeated string stream_ids = 1; }
+
+message GetStreamCountRequest {
+  string prefix = 1;  // empty = all streams
+  optional string tenant_id = 2;
+}
 message GetStreamCountResponse { int64  count  = 1; }
 
 message GetStreamsUpdatedAfterRequest {
   int64  after_sequence_position = 1;
-  sint32 limit                   = 2;   // 0 = no limit
+  // Absent means no limit. 0 is a real limit.
+  optional sint32 limit          = 2;
+  optional string tenant_id      = 3;
 }
+message GetStreamsUpdatedAfterResponse { repeated StreamMetadataProto streams = 1; }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Subscribe / GetCurrentSequence (portable Core IEventStoreSubscriptions)
@@ -196,8 +350,17 @@ message SubscribeRequest {
   oneof scope {
     bool   global_all = 3;              // EventSubscriptionFilter.All
     string stream_id  = 4;              // EventSubscriptionFilter.ForStream
-    bytes  query_json = 5;              // EventSubscriptionFilter.ForQuery (JSON Query)
+    Query  query      = 7;              // EventSubscriptionFilter.ForQuery
   }
+  reserved 5;
+  reserved "query_json";
+  // Optional tenant. No tenant-scoped subscription exists yet. Present,
+  // including empty, is rejected. Absent keeps the current subscription.
+  optional string tenant_id      = 6;
+}
+
+message SubscribeResponse {
+  SequencedEventProto event = 1;
 }
 
 message GetCurrentSequenceRequest {}
@@ -205,5 +368,3 @@ message GetCurrentSequenceRequest {}
 message GetCurrentSequenceResponse {
   int64 current_sequence = 1;
 }
-
-
