@@ -6,16 +6,18 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use bench_core::adapter::{
-    EsbAppendCondition, EsbQueryItem, EventData, EventStoreAdapter, ReadEvent, ReadRequest,
+    EsbAppendCondition, EsbQuery, EventData, EventStoreAdapter, ReadEvent, ReadRequest,
     ReadResponse, StoreDataDir, StoreManager, StoreManagerFactory, VecReadResponse,
 };
 use bench_core::wait_for_ready;
 use bench_testcontainers::boomerang::{Boomerang, BOOMERANG_PORT};
+use prost_types::Timestamp;
 use proto::event_store_service_client::EventStoreServiceClient;
 use proto::{
-    subscribe_request, AppendDcbRequest, AppendStreamRequest, GetCurrentSequenceRequest,
-    QueryItemProto, QueryProto, ReadByQueryRequest, ReadByQueryStreamRequest, ReadStreamRequest,
-    SequencedEventProto, SerializedEventProto, SubscribeRequest,
+    subscribe_request, AppendCondition, AppendDcbRequest, AppendStreamRequest, EventMetadata,
+    GetCurrentSequenceRequest, Query, QueryItem, ReadByQueryRequest, ReadByQueryStreamRequest,
+    ReadByQueryStreamResponse, ReadStreamRequest, SequencedEventProto, SerializedEventProto,
+    SubscribeRequest, SubscribeResponse,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -45,31 +47,63 @@ fn use_unary_read(limit: Option<u64>) -> bool {
     matches!(limit, Some(n) if (1..=UNARY_READ_LIMIT_MAX).contains(&n))
 }
 
-fn stream_rpc_limit(limit: Option<u64>) -> i32 {
+/// Stream reads omit `limit` when the harness has no limit. On this contract
+/// `0` is a real limit, and the old `0` meant unbounded, so both are absent.
+fn stream_rpc_limit(limit: Option<u64>) -> Option<i32> {
     match limit {
-        Some(n) if n > 0 => i32::try_from(n).unwrap_or(i32::MAX),
-        _ => 0,
+        Some(n) if n > 0 => Some(i32::try_from(n).unwrap_or(i32::MAX)),
+        _ => None,
     }
 }
 
-fn query_proto(tag: &str, event_type: Option<&str>) -> Option<QueryProto> {
-    let has_type = event_type.is_some();
-    let has_tag = !tag.is_empty();
-    if !has_type && !has_tag {
-        return None;
+/// Tag and type filters become one query item. No tag and no type is an empty
+/// item list, which matches every event.
+fn query_proto(tag: &str, event_type: Option<&str>) -> Query {
+    let types = event_type
+        .map(|event_type| vec![event_type.to_string()])
+        .unwrap_or_default();
+    let tags = if tag.is_empty() {
+        Vec::new()
+    } else {
+        vec![tag.to_string()]
+    };
+    if types.is_empty() && tags.is_empty() {
+        return Query {
+            ..Default::default()
+        };
     }
-    Some(QueryProto {
-        items: vec![QueryItemProto {
-            types: event_type.map(|t| vec![t.to_string()]).unwrap_or_default(),
-            tags: if has_tag {
-                vec![tag.to_string()]
-            } else {
-                Vec::new()
-            },
+    Query {
+        items: vec![QueryItem {
+            types,
+            tags,
             ..Default::default()
         }],
         ..Default::default()
-    })
+    }
+}
+
+/// .NET UTC ticks at 1970-01-01T00:00:00Z. The old read calls sent this clock
+/// as ticks; the typed contract uses `google.protobuf.Timestamp`.
+const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+const TICKS_PER_SECOND: i64 = 10_000_000;
+
+fn timestamp_from_utc_ticks(ticks: i64) -> Timestamp {
+    let since_unix = i128::from(ticks) - i128::from(UNIX_EPOCH_TICKS);
+    let seconds = since_unix.div_euclid(i128::from(TICKS_PER_SECOND));
+    let nanos = since_unix.rem_euclid(i128::from(TICKS_PER_SECOND)) * 100;
+    Timestamp {
+        seconds: seconds as i64,
+        nanos: nanos as i32,
+        ..Default::default()
+    }
+}
+
+/// `None` and `Some(0)` are the old "no time limit" sentinel.
+fn optional_to_time(utc_ticks: Option<i64>) -> Option<Timestamp> {
+    match utc_ticks {
+        Some(ticks) if ticks != 0 => Some(timestamp_from_utc_ticks(ticks)),
+        _ => None,
+    }
 }
 
 pub struct BoomerangStoreManager {
@@ -371,8 +405,11 @@ impl BoomerangAdapter {
             .map(|evt| SerializedEventProto {
                 type_name: evt.event_type.to_string(),
                 payload: evt.payload.to_vec(),
-                codec_id: 255, // opaque / unspecified bytes — raw sittings are not MemoryPack
-                schema_version: 0,
+                // Opaque / unspecified bytes. Raw benchmark payloads are not MemoryPack.
+                codec_id: 255,
+                // Leave schema_version absent. A present 0 is a different value on
+                // this contract; absent means frame version 1, the same as a
+                // missing or zero version on an older row.
                 ..Default::default()
             })
             .collect()
@@ -387,42 +424,143 @@ impl BoomerangAdapter {
             .collect()
     }
 
-    fn metadata_json(events: &[EventData]) -> Vec<u8> {
-        let mut custom = serde_json::Map::new();
-        for evt in events {
-            for (k, v) in evt.metadata.iter() {
-                custom.insert(k.clone(), serde_json::Value::String(v.clone()));
+    /// One metadata message for the batch. No pairs means the field is absent,
+    /// the same as the old empty metadata bytes.
+    fn event_metadata(events: &[EventData]) -> Option<EventMetadata> {
+        let mut custom = std::collections::HashMap::new();
+        for event in events {
+            for (key, value) in event.metadata.iter() {
+                custom.insert(key.clone(), value.clone());
             }
         }
         if custom.is_empty() {
-            return Vec::new();
+            None
+        } else {
+            Some(EventMetadata {
+                custom,
+                ..Default::default()
+            })
         }
-        serde_json::to_vec(&serde_json::json!({ "custom": custom })).unwrap_or_default()
     }
 
-    fn condition_json(condition: Option<EsbAppendCondition>) -> Vec<u8> {
+    fn query_from_esb(query: EsbQuery) -> Query {
+        Query {
+            items: query
+                .items
+                .into_iter()
+                .map(|item| QueryItem {
+                    types: item.types,
+                    tags: item.tags,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Unconditional appends still name a tag that matches nothing. An empty
+    /// query matches every event, which would fail the append.
+    fn append_condition(condition: Option<EsbAppendCondition>) -> AppendCondition {
         match condition {
-            None => serde_json::to_vec(&serde_json::json!({
-                "FailIfEventsMatch": {
-                    "Items": [{ "Types": [], "Tags": [UNCONDITIONAL_TAG] }]
-                }
-            }))
-            .expect("unconditional condition json"),
-            Some(cond) => {
-                let items: Vec<serde_json::Value> = cond
-                    .fail_if_events_match
-                    .items
-                    .into_iter()
-                    .map(|item: EsbQueryItem| query_item_json(&item.types, &item.tags))
-                    .collect();
-                let mut body = serde_json::json!({
-                    "FailIfEventsMatch": { "Items": items }
-                });
-                if let Some(after) = cond.after {
-                    body["After"] = serde_json::json!(after);
-                }
-                serde_json::to_vec(&body).expect("condition json")
-            }
+            None => AppendCondition {
+                fail_if_events_match: Some(Query {
+                    items: vec![QueryItem {
+                        tags: vec![UNCONDITIONAL_TAG.to_string()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(condition) => AppendCondition {
+                fail_if_events_match: Some(Self::query_from_esb(condition.fail_if_events_match)),
+                after: condition.after.map(|after| after as i64),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn append_dcb_request(
+        events: &[EventData],
+        condition: Option<EsbAppendCondition>,
+    ) -> AppendDcbRequest {
+        AppendDcbRequest {
+            events: Self::convert_events(events),
+            tags: Self::batch_tags(events),
+            condition: Some(Self::append_condition(condition)),
+            metadata: Self::event_metadata(events),
+            ..Default::default()
+        }
+    }
+
+    fn append_stream_request(
+        events: &[EventData],
+        stream_position: Option<usize>,
+    ) -> anyhow::Result<AppendStreamRequest> {
+        Ok(AppendStreamRequest {
+            stream_id: Self::stream_id_from_events(events)?,
+            events: Self::convert_events(events),
+            expected_version: Self::expected_version(stream_position),
+            tags: Self::batch_tags(events),
+            metadata: Self::event_metadata(events),
+            ..Default::default()
+        })
+    }
+
+    fn read_stream_request(stream_id: &str, to_time_ticks: Option<i64>) -> ReadStreamRequest {
+        ReadStreamRequest {
+            stream_id: stream_id.to_string(),
+            from_version: 0,
+            to_version: None,
+            to_time: optional_to_time(to_time_ticks),
+            ..Default::default()
+        }
+    }
+
+    fn read_by_query_request(
+        tag: &str,
+        event_type: Option<&str>,
+        from_offset: Option<u64>,
+        limit: u64,
+        to_time_ticks: Option<i64>,
+    ) -> ReadByQueryRequest {
+        ReadByQueryRequest {
+            from_sequence_position: Self::inclusive_from(from_offset),
+            limit: Some(i32::try_from(limit).unwrap_or(i32::MAX)),
+            to_sequence_position: None,
+            query: Some(query_proto(tag, event_type)),
+            to_time: optional_to_time(to_time_ticks),
+            ..Default::default()
+        }
+    }
+
+    fn read_by_query_stream_request(
+        tag: &str,
+        event_type: Option<&str>,
+        from_offset: Option<u64>,
+        limit: Option<u64>,
+        to_time_ticks: Option<i64>,
+    ) -> ReadByQueryStreamRequest {
+        ReadByQueryStreamRequest {
+            from_sequence_position: Self::inclusive_from(from_offset),
+            to_sequence_position: None,
+            limit: stream_rpc_limit(limit),
+            query: Some(query_proto(tag, event_type)),
+            to_time: optional_to_time(to_time_ticks),
+            ..Default::default()
+        }
+    }
+
+    fn subscribe_request(after: Option<u64>) -> SubscribeRequest {
+        // Inclusive start. No cursor starts at 0. A harness cursor is exclusive.
+        let from_sequence_position = after
+            .map(|position| position.saturating_add(1) as i64)
+            .unwrap_or(0);
+        SubscribeRequest {
+            subscriber_id: format!("esb-{}", uuid::Uuid::new_v4()),
+            from_sequence_position,
+            scope: Some(subscribe_request::Scope::GlobalAll(true)),
+            ..Default::default()
         }
     }
 
@@ -452,16 +590,9 @@ impl BoomerangAdapter {
         events: &[EventData],
         condition: Option<EsbAppendCondition>,
     ) -> anyhow::Result<Option<u64>> {
-        let request = AppendDcbRequest {
-            events: Self::convert_events(events),
-            condition_json: Self::condition_json(condition),
-            metadata_json: Self::metadata_json(events),
-            tags: Self::batch_tags(events),
-            ..Default::default()
-        };
+        let request = Self::append_dcb_request(events, condition);
         let mut client = self.client.clone();
         let response = check_rpc(client.append_dcb(request).await, "AppendDcb")?.into_inner();
-        refuse_follower(response.not_leader, &response.leader_endpoint, "AppendDcb")?;
         Ok(Self::last_position(&response.sequence_positions))
     }
 
@@ -480,8 +611,10 @@ impl BoomerangAdapter {
             })
     }
 
-    fn expected_version(stream_position: Option<usize>) -> i64 {
-        stream_position.map(|p| p as i64).unwrap_or(-1)
+    /// Absent when the harness does not ask for a version check. `Some(0)` is
+    /// version 0; the old `-1` sentinel is not sent.
+    fn expected_version(stream_position: Option<usize>) -> Option<i64> {
+        stream_position.map(|position| position as i64)
     }
 
     async fn append_stream_batch(
@@ -489,64 +622,24 @@ impl BoomerangAdapter {
         events: &[EventData],
         stream_position: Option<usize>,
     ) -> anyhow::Result<Option<u64>> {
-        let request = AppendStreamRequest {
-            stream_id: Self::stream_id_from_events(events)?,
-            events: Self::convert_events(events),
-            expected_version: Self::expected_version(stream_position),
-            metadata_json: Self::metadata_json(events),
-            tags: Self::batch_tags(events),
-            ..Default::default()
-        };
+        let request = Self::append_stream_request(events, stream_position)?;
         let mut client = self.client.clone();
         let response = check_rpc(client.append_stream(request).await, "AppendStream")?.into_inner();
-        refuse_follower(
-            response.not_leader,
-            &response.leader_endpoint,
-            "AppendStream",
-        )?;
         Ok(Self::last_position(&response.sequence_positions))
     }
 
     #[allow(dead_code)] // kept for tests; the hot path reads by query
     async fn read_stream_by_id(&self, stream_id: &str) -> anyhow::Result<Vec<SequencedEventProto>> {
-        let request = ReadStreamRequest {
-            stream_id: stream_id.to_string(),
-            from_version: 0,
-            to_version: -1,
-            to_timestamp: 0,
-            ..Default::default()
-        };
+        let request = Self::read_stream_request(stream_id, None);
         let mut client = self.client.clone();
         Ok(check_rpc(client.read_stream(request).await, "ReadStream")?
             .into_inner()
             .events)
     }
 
-    #[allow(dead_code)] // kept for tests; hot path sends empty query_json once proto is set
-    fn query_json(tag: &str, event_type: Option<&str>) -> Vec<u8> {
-        let has_type = event_type.is_some();
-        let has_tag = !tag.is_empty();
-        if !has_type && !has_tag {
-            return Vec::new();
-        }
-        let types: Vec<String> = event_type.map(|t| vec![t.to_string()]).unwrap_or_default();
-        let tags = if has_tag {
-            vec![tag.to_string()]
-        } else {
-            Vec::new()
-        };
-        serde_json::to_vec(&serde_json::json!({
-            "Items": [query_item_json(&types, &tags)]
-        }))
-        .unwrap_or_default()
-    }
-
-    /// Harness `from_offset` is exclusive; Boomerang `from_sequence_position` is inclusive.
-    fn inclusive_from(from_offset: Option<u64>) -> i64 {
-        match from_offset {
-            None => -1,
-            Some(after) => after.saturating_add(1) as i64,
-        }
+    /// Harness `from_offset` is exclusive. Absent starts at the beginning of the log.
+    fn inclusive_from(from_offset: Option<u64>) -> Option<i64> {
+        from_offset.map(|after| after.saturating_add(1) as i64)
     }
 }
 
@@ -557,9 +650,11 @@ const REASON_APPEND_OUTCOME_UNKNOWN: &str = "APPEND_OUTCOME_UNKNOWN";
 /// Slingshot failure decoded from a `google.rpc.ErrorInfo` detail
 /// (domain `slingshot.sellistix`) on the `grpc-status-details-bin` trailer.
 ///
-/// Every variant is terminal. `NOT_LEADER` is reported like the in-band flag.
-/// `APPEND_OUTCOME_UNKNOWN` may already be durable. Version and condition
-/// conflicts (`ABORTED`) must not be repeated.
+/// Every variant is terminal. `NOT_LEADER` means the call reached a follower.
+/// There is no in-band flag on the append response. `APPEND_OUTCOME_UNKNOWN`
+/// may already be durable. Version and condition conflicts (`ABORTED`,
+/// including `WRONG_EXPECTED_VERSION` and `APPEND_CONDITION_FAILED`) must not
+/// be repeated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SlingshotFailure {
     NotLeader { leader_endpoint: String },
@@ -629,16 +724,6 @@ fn follower_error(leader_endpoint: &str, rpc: &str) -> anyhow::Error {
     )
 }
 
-/// Cluster followers return `not_leader` instead of committing. A smoke run pointed at
-/// the wrong node must fail here; an empty sequence list would otherwise look like success.
-/// Reason `NOT_LEADER` on the gRPC status uses the same error.
-fn refuse_follower(not_leader: bool, leader_endpoint: &str, rpc: &str) -> Result<()> {
-    if not_leader {
-        return Err(follower_error(leader_endpoint, rpc));
-    }
-    Ok(())
-}
-
 fn grpc_status_error(status: tonic::Status, rpc: &str) -> anyhow::Error {
     let Some(failure) = slingshot_failure(&status) else {
         // No decoded reason. Still do not retry ABORTED or FAILED_PRECONDITION;
@@ -667,34 +752,6 @@ fn grpc_status_error(status: tonic::Status, rpc: &str) -> anyhow::Error {
 
 fn check_rpc<T>(result: Result<T, tonic::Status>, rpc: &str) -> Result<T> {
     result.map_err(|status| grpc_status_error(status, rpc))
-}
-
-/// PascalCase QueryItem JSON. Omit empty Types/Tags so Boomerang treats them as
-/// unrestricted (`null`) rather than an empty allow-list that matches nothing.
-fn query_item_json(types: &[String], tags: &[String]) -> serde_json::Value {
-    let mut item = serde_json::Map::new();
-    if !types.is_empty() {
-        item.insert(
-            "Types".to_string(),
-            serde_json::Value::Array(
-                types
-                    .iter()
-                    .map(|t| serde_json::Value::String(t.clone()))
-                    .collect(),
-            ),
-        );
-    }
-    if !tags.is_empty() {
-        item.insert(
-            "Tags".to_string(),
-            serde_json::Value::Array(
-                tags.iter()
-                    .map(|t| serde_json::Value::String(t.clone()))
-                    .collect(),
-            ),
-        );
-    }
-    serde_json::Value::Object(item)
 }
 
 #[async_trait]
@@ -744,22 +801,17 @@ impl EventStoreAdapter for BoomerangAdapter {
     }
 
     async fn read_stream(&self, req: ReadRequest) -> anyhow::Result<Box<dyn ReadResponse>> {
-        let query = query_proto(&req.tag, req.event_type.as_deref());
-        // Proto is the hot path (R3). JSON dual-write was a pre-Gate-A shim for images
-        // that ignored field 6; those images are gone. Empty query_json skips the
-        // PascalCase JSON parse on every unary/stream read.
-        let from_sequence_position = Self::inclusive_from(req.from_offset);
-
+        // Small limits use one ReadByQuery response. Larger and unbounded reads
+        // use the stream. An empty query item list matches every event.
+        let event_type = req.event_type.as_deref();
         if use_unary_read(req.limit) {
-            let request = ReadByQueryRequest {
-                query_json: Vec::new(),
-                from_sequence_position,
-                limit: req.limit.expect("use_unary_read") as i32,
-                to_sequence_position: -1,
-                to_timestamp: 0,
-                query,
-                ..Default::default()
-            };
+            let request = Self::read_by_query_request(
+                &req.tag,
+                event_type,
+                req.from_offset,
+                req.limit.expect("use_unary_read"),
+                None,
+            );
             let mut client = self.client.clone();
             let response =
                 check_rpc(client.read_by_query(request).await, "ReadByQuery")?.into_inner();
@@ -767,15 +819,13 @@ impl EventStoreAdapter for BoomerangAdapter {
             return Ok(Box::new(VecReadResponse::new(events)));
         }
 
-        let request = ReadByQueryStreamRequest {
-            query_json: Vec::new(),
-            from_sequence_position,
-            to_sequence_position: -1,
-            to_timestamp: 0,
-            limit: stream_rpc_limit(req.limit),
-            query,
-            ..Default::default()
-        };
+        let request = Self::read_by_query_stream_request(
+            &req.tag,
+            event_type,
+            req.from_offset,
+            req.limit,
+            None,
+        );
         let mut client = self.client.clone();
         let stream = check_rpc(
             client.read_by_query_stream(request).await,
@@ -783,37 +833,23 @@ impl EventStoreAdapter for BoomerangAdapter {
         )?
         .into_inner();
         Ok(Box::new(BoomerangReadResponse {
-            stream,
+            stream: EventStream::ByQuery(stream),
             remaining: req.limit,
         }))
     }
 
     async fn subscribe(&self, after: Option<u64>) -> anyhow::Result<Box<dyn ReadResponse>> {
-        let from = after.map(|a| a.saturating_add(1) as i64).unwrap_or(0);
-        let request = SubscribeRequest {
-            subscriber_id: format!("esb-{}", uuid::Uuid::new_v4()),
-            from_sequence_position: from,
-            scope: Some(subscribe_request::Scope::GlobalAll(true)),
-            ..Default::default()
-        };
+        let request = Self::subscribe_request(after);
         let mut client = self.client.clone();
         let stream = check_rpc(client.subscribe(request).await, "Subscribe")?.into_inner();
         Ok(Box::new(BoomerangReadResponse {
-            stream,
+            stream: EventStream::Subscribe(stream),
             remaining: None,
         }))
     }
 
     async fn read_all(&self) -> Result<Box<dyn ReadResponse>> {
-        let request = ReadByQueryStreamRequest {
-            query_json: Vec::new(),
-            from_sequence_position: -1,
-            to_sequence_position: -1,
-            to_timestamp: 0,
-            limit: 0,
-            query: None,
-            ..Default::default()
-        };
+        let request = Self::read_by_query_stream_request("", None, None, None, None);
         let mut client = self.client.clone();
         let stream = check_rpc(
             client.read_by_query_stream(request).await,
@@ -821,14 +857,41 @@ impl EventStoreAdapter for BoomerangAdapter {
         )?
         .into_inner();
         Ok(Box::new(BoomerangReadResponse {
-            stream,
+            stream: EventStream::ByQuery(stream),
             remaining: None,
         }))
     }
 }
 
+enum EventStream {
+    ByQuery(tonic::Streaming<ReadByQueryStreamResponse>),
+    Subscribe(tonic::Streaming<SubscribeResponse>),
+}
+
+impl EventStream {
+    /// The stream item is a wrapper. The sequenced event is field 1. A wrapper
+    /// with no event is skipped so it is not the end of the stream.
+    async fn message(&mut self) -> Result<Option<SequencedEventProto>, tonic::Status> {
+        loop {
+            let event = match self {
+                Self::ByQuery(stream) => match stream.message().await? {
+                    Some(response) => response.event,
+                    None => return Ok(None),
+                },
+                Self::Subscribe(stream) => match stream.message().await? {
+                    Some(response) => response.event,
+                    None => return Ok(None),
+                },
+            };
+            if event.is_some() {
+                return Ok(event);
+            }
+        }
+    }
+}
+
 struct BoomerangReadResponse {
-    stream: tonic::Streaming<SequencedEventProto>,
+    stream: EventStream,
     remaining: Option<u64>,
 }
 
@@ -871,37 +934,15 @@ fn map_read_event(proto: SequencedEventProto) -> ReadEvent {
         offset: proto.sequence_position.max(0) as u64,
         event_type,
         payload,
-        metadata: metadata_from_json(&proto.metadata_json),
+        metadata: metadata_pairs(proto.metadata),
     }
 }
 
-fn metadata_from_json(bytes: &[u8]) -> Vec<(String, String)> {
-    if bytes.is_empty() {
-        return Vec::new();
-    }
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+fn metadata_pairs(metadata: Option<EventMetadata>) -> Vec<(String, String)> {
+    let Some(metadata) = metadata else {
         return Vec::new();
     };
-    let Some(obj) = value.as_object() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    if let Some(custom) = obj.get("custom").and_then(|c| c.as_object()) {
-        for (k, v) in custom {
-            if let Some(s) = v.as_str() {
-                out.push((k.clone(), s.to_string()));
-            }
-        }
-    }
-    for (k, v) in obj {
-        if k == "custom" {
-            continue;
-        }
-        if let Some(s) = v.as_str() {
-            out.push((k.clone(), s.to_string()));
-        }
-    }
-    out
+    metadata.custom.into_iter().collect()
 }
 
 pub struct BoomerangFactory;
@@ -923,6 +964,7 @@ impl StoreManagerFactory for BoomerangFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bench_core::adapter::EsbQueryItem;
 
     fn sample_events() -> Vec<EventData> {
         vec![
@@ -1046,73 +1088,29 @@ mod tests {
     }
 
     #[test]
-    fn query_proto_hot_path_omits_all() {
-        assert!(query_proto("", None).is_none());
-        let q = query_proto("t", Some("e")).expect("tagged typed query");
-        assert_eq!(q.items[0].tags, vec!["t"]);
-        assert_eq!(q.items[0].types, vec!["e"]);
+    fn query_proto_empty_items_match_every_event() {
+        let all = query_proto("", None);
+        assert!(all.items.is_empty());
+
+        let filtered = query_proto("t", Some("e"));
+        assert_eq!(filtered.items[0].tags, vec!["t"]);
+        assert_eq!(filtered.items[0].types, vec!["e"]);
+        assert!(filtered.items[0].partition_filter.is_none());
+
+        let tag_only = query_proto("t", None);
+        assert!(tag_only.items[0].types.is_empty());
+        assert_eq!(tag_only.items[0].tags, vec!["t"]);
+
+        let type_only = query_proto("", Some("e"));
+        assert_eq!(type_only.items[0].types, vec!["e"]);
+        assert!(type_only.items[0].tags.is_empty());
     }
 
     #[test]
-    fn query_json_emits_pascal_case_items() {
-        let json = BoomerangAdapter::query_json("t", Some("e"));
-        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        assert_eq!(v["Items"][0]["Tags"][0], "t");
-        assert_eq!(v["Items"][0]["Types"][0], "e");
-    }
-
-    /// D2 magnitude: harness-side `one_tag_one_type` + `after = 0` build + serialize.
-    /// Timed loop (not a keep signal). Print mean ns; the plan records it.
-    #[test]
-    fn d2_condition_json_h2h_cost() {
-        let tag = "stream-0-";
-        let event_type = "test-0";
-        let iterations = 200_000u32;
-
-        let sample = h2h_condition_json(tag, event_type);
-        let v: serde_json::Value = serde_json::from_slice(&sample).unwrap();
-        assert_eq!(v["FailIfEventsMatch"]["Items"][0]["Tags"][0], tag);
-        assert_eq!(v["FailIfEventsMatch"]["Items"][0]["Types"][0], event_type);
-        assert_eq!(v["After"], 0);
-
-        for _ in 0..20_000 {
-            let _ = h2h_condition_json(tag, event_type);
-        }
-
-        let started = std::time::Instant::now();
-        let mut bytes = 0usize;
-        for _ in 0..iterations {
-            bytes = h2h_condition_json(tag, event_type).len();
-        }
-        let elapsed = started.elapsed();
-        let mean_ns = elapsed.as_nanos() as f64 / f64::from(iterations);
-        println!(
-            "D2 harness condition_json H2H ({iterations} iters): {mean_ns:.1} ns ({:.3} µs) bytes={bytes}",
-            mean_ns / 1000.0
-        );
-        assert!(mean_ns > 0.0);
-        assert!(bytes > 0);
-    }
-
-    fn h2h_condition_json(tag: &str, event_type: &str) -> Vec<u8> {
-        let condition = Some(
-            EsbAppendCondition::new(
-                bench_core::adapter::EsbQuery::new().item(
-                    EsbQueryItem::new()
-                        .tags(vec![tag.to_string()])
-                        .types(vec![event_type.to_string()]),
-                ),
-            )
-            .after(Some(0)),
-        );
-        BoomerangAdapter::condition_json(condition)
-    }
-
-    #[test]
-    fn stream_rpc_limit_zero_means_unbounded() {
-        assert_eq!(stream_rpc_limit(None), 0);
-        assert_eq!(stream_rpc_limit(Some(0)), 0);
-        assert_eq!(stream_rpc_limit(Some(257)), 257);
+    fn stream_rpc_limit_absent_means_unbounded() {
+        assert_eq!(stream_rpc_limit(None), None);
+        assert_eq!(stream_rpc_limit(Some(0)), None);
+        assert_eq!(stream_rpc_limit(Some(257)), Some(257));
     }
 
     #[test]
@@ -1122,9 +1120,9 @@ mod tests {
             BoomerangAdapter::stream_id_from_events(&events).unwrap(),
             "tag1"
         );
-        assert_eq!(BoomerangAdapter::expected_version(None), -1);
-        assert_eq!(BoomerangAdapter::expected_version(Some(0)), 0);
-        assert_eq!(BoomerangAdapter::expected_version(Some(9)), 9);
+        assert_eq!(BoomerangAdapter::expected_version(None), None);
+        assert_eq!(BoomerangAdapter::expected_version(Some(0)), Some(0));
+        assert_eq!(BoomerangAdapter::expected_version(Some(9)), Some(9));
         let empty = EventData {
             payload: Arc::from(vec![1u8]),
             event_type: Arc::from("t"),
@@ -1339,6 +1337,287 @@ mod tests {
         assert_eq!(manager.store_name, "boomerang");
     }
 
+    fn one_tag_one_type(tag: &str, event_type: &str) -> EsbAppendCondition {
+        EsbAppendCondition::new(
+            EsbQuery::new().item(
+                EsbQueryItem::new()
+                    .tags(vec![tag.to_string()])
+                    .types(vec![event_type.to_string()]),
+            ),
+        )
+        .after(Some(0))
+    }
+
+    #[test]
+    fn typed_request_builders_keep_today_behaviour() {
+        let events = sample_events();
+        let dcb = BoomerangAdapter::append_dcb_request(&events, None);
+        let condition = dcb.condition.expect("condition is required");
+        let fail_if = condition
+            .fail_if_events_match
+            .expect("fail if events match");
+        assert_eq!(fail_if.items[0].tags, vec![UNCONDITIONAL_TAG]);
+        assert!(fail_if.items[0].types.is_empty());
+        assert!(condition.after.is_none());
+        assert!(condition.consistency_marker.is_none());
+        assert!(dcb.tenant_id.is_none());
+        assert!(dcb.request_id.is_empty());
+        assert_eq!(dcb.tags, vec!["tag1".to_string(), "tag2".to_string()]);
+        assert_eq!(dcb.events[0].type_name, "type1");
+        assert_eq!(dcb.events[0].payload, vec![1, 2, 3]);
+        assert_eq!(dcb.events[0].codec_id, 255);
+        assert!(dcb.events[0].schema_version.is_none());
+        assert_eq!(dcb.events[1].payload, vec![4, 5, 6]);
+        let custom = &dcb.metadata.expect("custom metadata").custom;
+        assert_eq!(
+            custom.get("timestamp").map(String::as_str),
+            Some("123456789")
+        );
+
+        let guarded = BoomerangAdapter::append_dcb_request(
+            &events[..1],
+            Some(one_tag_one_type("stream-0-", "test-0")),
+        );
+        let guarded_condition = guarded.condition.expect("condition");
+        assert_eq!(guarded_condition.after, Some(0));
+        let guarded_query = guarded_condition
+            .fail_if_events_match
+            .expect("fail if events match");
+        assert_eq!(guarded_query.items[0].tags, vec!["stream-0-"]);
+        assert_eq!(guarded_query.items[0].types, vec!["test-0"]);
+        assert!(guarded.metadata.is_none());
+
+        let bare = EventData {
+            payload: Arc::from(vec![9u8]),
+            event_type: Arc::from("bare"),
+            tags: Arc::from([Arc::from("stream-a")]),
+            metadata: Arc::from([]),
+        };
+        let append =
+            BoomerangAdapter::append_stream_request(std::slice::from_ref(&bare), None).unwrap();
+        assert_eq!(append.stream_id, "stream-a");
+        assert!(append.expected_version.is_none());
+        assert!(append.metadata.is_none());
+        assert!(append.request_id.is_empty());
+        assert_eq!(append.events[0].codec_id, 255);
+        assert!(append.events[0].schema_version.is_none());
+
+        let checked = BoomerangAdapter::append_stream_request(&[bare], Some(0)).unwrap();
+        assert_eq!(checked.expected_version, Some(0));
+
+        let by_id = BoomerangAdapter::read_stream_request("stream-a", None);
+        assert_eq!(by_id.from_version, 0);
+        assert!(by_id.to_version.is_none());
+        assert!(by_id.to_time.is_none());
+
+        let unary =
+            BoomerangAdapter::read_by_query_request("tag1", Some("type1"), Some(4), 10, None);
+        assert_eq!(unary.from_sequence_position, Some(5));
+        assert_eq!(unary.limit, Some(10));
+        assert!(unary.to_sequence_position.is_none());
+        assert!(unary.to_time.is_none());
+        assert!(unary.tenant_id.is_none());
+        let unary_query = unary.query.expect("query");
+        assert_eq!(unary_query.items[0].tags, vec!["tag1"]);
+        assert_eq!(unary_query.items[0].types, vec!["type1"]);
+
+        let stream = BoomerangAdapter::read_by_query_stream_request("", None, None, None, None);
+        assert!(stream.from_sequence_position.is_none());
+        assert!(stream.to_sequence_position.is_none());
+        assert!(stream.limit.is_none());
+        assert!(stream.to_time.is_none());
+        assert!(stream.tenant_id.is_none());
+        assert!(stream.query.expect("query all").items.is_empty());
+
+        let limited =
+            BoomerangAdapter::read_by_query_stream_request("t", None, None, Some(257), None);
+        assert_eq!(limited.limit, Some(257));
+
+        let from_start = BoomerangAdapter::subscribe_request(None);
+        assert_eq!(from_start.from_sequence_position, 0);
+        assert!(from_start.tenant_id.is_none());
+        assert!(matches!(
+            from_start.scope,
+            Some(subscribe_request::Scope::GlobalAll(true))
+        ));
+        assert!(from_start.subscriber_id.starts_with("esb-"));
+
+        let caught_up = BoomerangAdapter::subscribe_request(Some(8));
+        assert_eq!(caught_up.from_sequence_position, 9);
+    }
+
+    #[test]
+    fn utc_ticks_convert_to_protobuf_timestamp() {
+        let epoch = timestamp_from_utc_ticks(UNIX_EPOCH_TICKS);
+        assert_eq!(epoch.seconds, 0);
+        assert_eq!(epoch.nanos, 0);
+
+        // 2020-01-01T00:00:00.000000100Z is one tick past that second.
+        let ticks = UNIX_EPOCH_TICKS + 1_577_836_800 * TICKS_PER_SECOND + 1;
+        let stamp = timestamp_from_utc_ticks(ticks);
+        assert_eq!(stamp.seconds, 1_577_836_800);
+        assert_eq!(stamp.nanos, 100);
+
+        // One tick before the Unix epoch keeps nanos non-negative.
+        let before = timestamp_from_utc_ticks(UNIX_EPOCH_TICKS - 1);
+        assert_eq!(before.seconds, -1);
+        assert_eq!(before.nanos, 999_999_900);
+
+        assert!(optional_to_time(None).is_none());
+        assert!(optional_to_time(Some(0)).is_none());
+        let request = BoomerangAdapter::read_stream_request("stream", Some(UNIX_EPOCH_TICKS));
+        let to_time = request.to_time.expect("time limit");
+        assert_eq!(to_time.seconds, 0);
+        assert_eq!(to_time.nanos, 0);
+        let open = BoomerangAdapter::read_by_query_request("t", None, None, 10, Some(0));
+        assert!(open.to_time.is_none());
+        let bounded = BoomerangAdapter::read_by_query_stream_request(
+            "",
+            None,
+            None,
+            None,
+            Some(UNIX_EPOCH_TICKS + TICKS_PER_SECOND),
+        );
+        assert_eq!(bounded.to_time.expect("time limit").seconds, 1);
+    }
+
+    #[test]
+    fn optional_fields_are_absent_instead_of_sentinels() {
+        let read = ReadStreamRequest {
+            stream_id: "stream".into(),
+            from_version: 0,
+            ..Default::default()
+        };
+        assert!(read.to_version.is_none());
+        assert!(read.to_time.is_none());
+
+        let real_bounds = ReadStreamRequest {
+            stream_id: "stream".into(),
+            from_version: 0,
+            to_version: Some(-1),
+            to_time: Some(Timestamp {
+                seconds: 0,
+                nanos: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(real_bounds.to_version, Some(-1));
+        assert!(real_bounds.to_time.is_some());
+
+        let query = ReadByQueryRequest {
+            limit: Some(10),
+            ..Default::default()
+        };
+        assert!(query.from_sequence_position.is_none());
+        assert!(query.to_sequence_position.is_none());
+        assert!(query.tenant_id.is_none());
+        assert_eq!(query.limit, Some(10));
+
+        let zero_limit = ReadByQueryStreamRequest {
+            limit: Some(0),
+            from_sequence_position: Some(-1),
+            ..Default::default()
+        };
+        assert_eq!(zero_limit.limit, Some(0));
+        assert_eq!(zero_limit.from_sequence_position, Some(-1));
+        assert!(zero_limit.to_sequence_position.is_none());
+
+        let append = AppendStreamRequest {
+            stream_id: "stream".into(),
+            expected_version: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(append.expected_version, Some(0));
+        assert!(append.metadata.is_none());
+
+        let no_check = AppendStreamRequest {
+            stream_id: "stream".into(),
+            ..Default::default()
+        };
+        assert!(no_check.expected_version.is_none());
+
+        let updated = proto::GetStreamsUpdatedAfterRequest {
+            after_sequence_position: 4,
+            ..Default::default()
+        };
+        assert_eq!(updated.after_sequence_position, 4);
+        assert!(updated.limit.is_none());
+        assert!(updated.tenant_id.is_none());
+        let zero_is_real = proto::GetStreamsUpdatedAfterRequest {
+            after_sequence_position: 4,
+            limit: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(zero_is_real.limit, Some(0));
+    }
+
+    #[test]
+    fn metadata_custom_round_trips_through_the_typed_message() {
+        let written = BoomerangAdapter::event_metadata(&sample_events()).expect("custom");
+        assert_eq!(
+            written.custom.get("timestamp").map(String::as_str),
+            Some("123456789")
+        );
+        assert!(written.user_id.is_none());
+        assert!(written.timestamp.is_none());
+        assert!(written.event_id.is_none());
+
+        let pairs = metadata_pairs(Some(written));
+        assert!(pairs
+            .iter()
+            .any(|(key, value)| key == "timestamp" && value == "123456789"));
+
+        let bare = EventData {
+            payload: Arc::from(vec![1u8]),
+            event_type: Arc::from("t"),
+            tags: Arc::from([Arc::from("s")]),
+            metadata: Arc::from([]),
+        };
+        assert!(BoomerangAdapter::event_metadata(&[bare]).is_none());
+        assert!(metadata_pairs(None).is_empty());
+        assert!(metadata_pairs(Some(EventMetadata {
+            ..Default::default()
+        }))
+        .is_empty());
+
+        let mut custom = std::collections::HashMap::new();
+        custom.insert("timestamp".to_string(), "123456789".to_string());
+        custom.insert("source".to_string(), "bench".to_string());
+        let read = map_read_event(SequencedEventProto {
+            event: Some(SerializedEventProto {
+                type_name: "type2".into(),
+                payload: vec![4, 5, 6],
+                codec_id: 255,
+                ..Default::default()
+            }),
+            sequence_position: 7,
+            metadata: Some(EventMetadata {
+                custom,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(read.offset, 7);
+        assert_eq!(read.event_type, "type2");
+        assert_eq!(read.payload, vec![4, 5, 6]);
+        assert_eq!(read.metadata.len(), 2);
+        assert!(read
+            .metadata
+            .iter()
+            .any(|(key, value)| key == "timestamp" && value == "123456789"));
+        assert!(read
+            .metadata
+            .iter()
+            .any(|(key, value)| key == "source" && value == "bench"));
+
+        let missing = map_read_event(SequencedEventProto {
+            ..Default::default()
+        });
+        assert!(missing.metadata.is_empty());
+        assert!(missing.event_type.is_empty());
+    }
+
     /// Compile check: every prost request literal fills fields the adapter does
     /// not set from `Default`. A new optional proto field must not break this.
     #[test]
@@ -1346,55 +1625,83 @@ mod tests {
         let append_stream = AppendStreamRequest {
             stream_id: "stream".into(),
             events: vec![],
-            expected_version: -1,
-            metadata_json: vec![1],
+            expected_version: None,
             tags: vec!["t".into()],
+            metadata: None,
             ..Default::default()
         };
         assert_eq!(append_stream.stream_id, "stream");
-        assert_eq!(append_stream.expected_version, -1);
+        assert!(append_stream.expected_version.is_none());
+        assert!(append_stream.metadata.is_none());
         assert!(append_stream.request_id.is_empty());
 
         let append_dcb = AppendDcbRequest {
             events: vec![],
-            condition_json: vec![2],
-            metadata_json: vec![],
             tags: vec!["t".into()],
+            condition: Some(AppendCondition {
+                fail_if_events_match: Some(Query {
+                    items: vec![QueryItem {
+                        tags: vec![UNCONDITIONAL_TAG.into()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            metadata: None,
             ..Default::default()
         };
-        assert_eq!(append_dcb.condition_json, vec![2]);
+        assert!(append_dcb.tenant_id.is_none());
         assert!(append_dcb.request_id.is_empty());
+        assert!(append_dcb
+            .condition
+            .as_ref()
+            .and_then(|condition| condition.after)
+            .is_none());
 
         let read_stream = ReadStreamRequest {
             stream_id: "stream".into(),
             from_version: 0,
-            to_version: -1,
-            to_timestamp: 0,
+            to_version: None,
+            to_time: None,
             ..Default::default()
         };
-        assert_eq!(read_stream.to_version, -1);
+        assert!(read_stream.to_version.is_none());
+        assert!(read_stream.to_time.is_none());
 
         let read_by_query = ReadByQueryRequest {
-            query_json: vec![],
-            from_sequence_position: -1,
-            limit: 10,
-            to_sequence_position: -1,
-            to_timestamp: 0,
-            query: None,
+            from_sequence_position: None,
+            limit: Some(10),
+            to_sequence_position: None,
+            query: Some(Query {
+                ..Default::default()
+            }),
+            to_time: None,
             ..Default::default()
         };
-        assert_eq!(read_by_query.limit, 10);
+        assert_eq!(read_by_query.limit, Some(10));
+        assert!(read_by_query.tenant_id.is_none());
 
         let read_by_query_stream = ReadByQueryStreamRequest {
-            query_json: vec![],
-            from_sequence_position: -1,
-            to_sequence_position: -1,
-            to_timestamp: 0,
-            limit: 0,
-            query: None,
+            from_sequence_position: None,
+            to_sequence_position: None,
+            limit: None,
+            query: Some(Query {
+                items: vec![QueryItem {
+                    types: vec!["e".into()],
+                    tags: vec!["t".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            to_time: None,
             ..Default::default()
         };
-        assert_eq!(read_by_query_stream.limit, 0);
+        assert!(read_by_query_stream.limit.is_none());
+        assert_eq!(
+            read_by_query_stream.query.expect("query").items[0].tags,
+            vec!["t"]
+        );
 
         let subscribe = SubscribeRequest {
             subscriber_id: "esb".into(),
@@ -1403,6 +1710,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(subscribe.from_sequence_position, 1);
+        assert!(subscribe.tenant_id.is_none());
 
         let _current = GetCurrentSequenceRequest {
             ..Default::default()
@@ -1412,48 +1720,54 @@ mod tests {
             type_name: "type".into(),
             payload: vec![1],
             codec_id: 255,
-            schema_version: 0,
             ..Default::default()
         };
         assert_eq!(event.codec_id, 255);
+        assert!(event.schema_version.is_none());
 
-        let query = QueryProto {
-            items: vec![QueryItemProto {
-                types: vec!["e".into()],
-                tags: vec!["t".into()],
-                ..Default::default()
-            }],
+        let metadata = EventMetadata {
+            custom: std::collections::HashMap::from([("timestamp".into(), "1".into())]),
             ..Default::default()
         };
-        assert_eq!(query.items[0].tags, vec!["t"]);
+        assert_eq!(
+            metadata.custom.get("timestamp").map(String::as_str),
+            Some("1")
+        );
+        assert!(metadata.correlation_id.is_none());
 
         // Registry calls. Same literal shape, so a new optional field stays source-compatible.
-        let _ = proto::GetStreamRequest {
+        let stream = proto::GetStreamRequest {
             stream_id: "stream".into(),
             ..Default::default()
         };
-        let _ = proto::GetStreamsByAggregateTypeRequest {
+        assert!(stream.tenant_id.is_none());
+        let by_type = proto::GetStreamsByAggregateTypeRequest {
             aggregate_type: "order".into(),
             ..Default::default()
         };
-        let _ = proto::GetStreamsByTagRequest {
+        assert!(by_type.tenant_id.is_none());
+        let by_tag = proto::GetStreamsByTagRequest {
             tag: "t".into(),
             ..Default::default()
         };
-        let _ = proto::EnumerateStreamIdsRequest {
+        assert!(by_tag.tenant_id.is_none());
+        let enumerated = proto::EnumerateStreamIdsRequest {
             prefix: String::new(),
             ..Default::default()
         };
-        let _ = proto::GetStreamCountRequest {
+        assert!(enumerated.tenant_id.is_none());
+        let count = proto::GetStreamCountRequest {
             prefix: String::new(),
             ..Default::default()
         };
+        assert!(count.tenant_id.is_none());
         let updated = proto::GetStreamsUpdatedAfterRequest {
             after_sequence_position: 4,
-            limit: 0,
+            limit: None,
             ..Default::default()
         };
         assert_eq!(updated.after_sequence_position, 4);
+        assert!(updated.limit.is_none());
     }
 
     fn status_with_reason(
@@ -1473,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn not_leader_reason_matches_in_band_follower_error() {
+    fn not_leader_reason_fails_without_an_in_band_field() {
         let status = status_with_reason(
             tonic::Code::Unavailable,
             REASON_NOT_LEADER,
@@ -1489,11 +1803,30 @@ mod tests {
         assert!(!failure.retryable());
         assert!(!grpc_status_retryable(&status));
 
-        let from_trailer = grpc_status_error(status, "AppendStream");
-        let from_flag = refuse_follower(true, "http://10.0.0.8:50051", "AppendStream")
-            .expect_err("in-band not_leader fails");
-        assert_eq!(from_trailer.to_string(), from_flag.to_string());
-        assert!(refuse_follower(false, "http://10.0.0.8:50051", "AppendStream").is_ok());
+        let err = grpc_status_error(status, "AppendStream");
+        let message = err.to_string();
+        assert!(
+            message.contains("reached a follower")
+                && message.contains("http://10.0.0.8:50051")
+                && message.contains("Point BOOMERANG_URI at the Raft leader"),
+            "{message}"
+        );
+
+        // The append response no longer carries a follower flag. The status
+        // reason above is the whole signal.
+        let response = proto::AppendStreamResponse {
+            sequence_positions: vec![4],
+            ..Default::default()
+        };
+        assert_eq!(response.sequence_positions, vec![4]);
+        assert!(response.consistency_marker.is_none());
+        assert!(response.last_stream_version.is_none());
+        let dcb = proto::AppendDcbResponse {
+            ..Default::default()
+        };
+        assert!(dcb.sequence_positions.is_empty());
+        assert!(dcb.consistency_marker.is_none());
+        assert!(dcb.last_stream_version.is_none());
     }
 
     #[test]
@@ -1515,37 +1848,26 @@ mod tests {
             "{unknown_err}"
         );
 
-        let version = status_with_reason(tonic::Code::Aborted, "EXPECTED_VERSION_CONFLICT", &[]);
-        assert_eq!(
-            slingshot_failure(&version),
-            Some(SlingshotFailure::Conflict {
-                reason: "EXPECTED_VERSION_CONFLICT".into(),
-            })
-        );
-        assert!(!grpc_status_retryable(&version));
-        let version_err = grpc_status_error(version, "AppendStream");
-        assert!(
-            version_err
-                .to_string()
-                .contains("EXPECTED_VERSION_CONFLICT")
-                && version_err.to_string().contains("not retrying"),
-            "{version_err}"
-        );
-
-        let condition = status_with_reason(tonic::Code::Aborted, "CONDITION_CONFLICT", &[]);
-        assert_eq!(
-            slingshot_failure(&condition),
-            Some(SlingshotFailure::Conflict {
-                reason: "CONDITION_CONFLICT".into(),
-            })
-        );
-        assert!(!slingshot_failure(&condition).unwrap().retryable());
-        let condition_err = grpc_status_error(condition, "AppendDcb");
-        assert!(
-            condition_err.to_string().contains("CONDITION_CONFLICT")
-                && condition_err.to_string().contains("not retrying"),
-            "{condition_err}"
-        );
+        for reason in [
+            "WRONG_EXPECTED_VERSION",
+            "APPEND_CONDITION_FAILED",
+            "SOME_OTHER_ABORT",
+        ] {
+            let status = status_with_reason(tonic::Code::Aborted, reason, &[]);
+            assert_eq!(
+                slingshot_failure(&status),
+                Some(SlingshotFailure::Conflict {
+                    reason: reason.into(),
+                })
+            );
+            assert!(!slingshot_failure(&status).unwrap().retryable());
+            assert!(!grpc_status_retryable(&status));
+            let err = grpc_status_error(status, "AppendStream");
+            assert!(
+                err.to_string().contains(reason) && err.to_string().contains("not retrying"),
+                "{err}"
+            );
+        }
 
         let aborted = tonic::Status::new(tonic::Code::Aborted, "conflict");
         assert_eq!(
@@ -1735,10 +2057,20 @@ mod tests {
         }
     }
 
-    struct EmptyEvents;
+    struct EmptyStream<T> {
+        _item: std::marker::PhantomData<T>,
+    }
 
-    impl tonic::codegen::tokio_stream::Stream for EmptyEvents {
-        type Item = std::result::Result<SequencedEventProto, tonic::Status>;
+    impl<T> EmptyStream<T> {
+        fn new() -> Self {
+            Self {
+                _item: std::marker::PhantomData,
+            }
+        }
+    }
+
+    impl<T> tonic::codegen::tokio_stream::Stream for EmptyStream<T> {
+        type Item = std::result::Result<T, tonic::Status>;
 
         fn poll_next(
             self: std::pin::Pin<&mut Self>,
@@ -1753,14 +2085,15 @@ mod tests {
         async fn append_stream(
             &self,
             _request: tonic::Request<AppendStreamRequest>,
-        ) -> std::result::Result<tonic::Response<proto::AppendResponse>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<proto::AppendStreamResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("stub"))
         }
 
         async fn append_dcb(
             &self,
             _request: tonic::Request<AppendDcbRequest>,
-        ) -> std::result::Result<tonic::Response<proto::AppendResponse>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<proto::AppendDcbResponse>, tonic::Status> {
             Err(tonic::Status::unimplemented("stub"))
         }
 
@@ -1772,11 +2105,11 @@ mod tests {
             Err(tonic::Status::unimplemented("stub"))
         }
 
-        type ReadStreamEnumerableStream = EmptyEvents;
+        type ReadStreamEnumerableStream = EmptyStream<proto::ReadStreamEnumerableResponse>;
 
         async fn read_stream_enumerable(
             &self,
-            _request: tonic::Request<ReadStreamRequest>,
+            _request: tonic::Request<proto::ReadStreamEnumerableRequest>,
         ) -> std::result::Result<tonic::Response<Self::ReadStreamEnumerableStream>, tonic::Status>
         {
             Err(tonic::Status::unimplemented("stub"))
@@ -1790,7 +2123,7 @@ mod tests {
             Err(tonic::Status::unimplemented("stub"))
         }
 
-        type ReadByQueryStreamStream = EmptyEvents;
+        type ReadByQueryStreamStream = EmptyStream<proto::ReadByQueryStreamResponse>;
 
         async fn read_by_query_stream(
             &self,
@@ -1798,10 +2131,10 @@ mod tests {
         ) -> std::result::Result<tonic::Response<Self::ReadByQueryStreamStream>, tonic::Status>
         {
             self.record("ReadByQueryStream", request.metadata());
-            Ok(tonic::Response::new(EmptyEvents))
+            Ok(tonic::Response::new(EmptyStream::new()))
         }
 
-        type SubscribeStream = EmptyEvents;
+        type SubscribeStream = EmptyStream<proto::SubscribeResponse>;
 
         async fn subscribe(
             &self,
@@ -1832,15 +2165,17 @@ mod tests {
         async fn get_streams_by_aggregate_type(
             &self,
             _request: tonic::Request<proto::GetStreamsByAggregateTypeRequest>,
-        ) -> std::result::Result<tonic::Response<proto::StreamListResponse>, tonic::Status>
-        {
+        ) -> std::result::Result<
+            tonic::Response<proto::GetStreamsByAggregateTypeResponse>,
+            tonic::Status,
+        > {
             Err(tonic::Status::unimplemented("stub"))
         }
 
         async fn get_streams_by_tag(
             &self,
             _request: tonic::Request<proto::GetStreamsByTagRequest>,
-        ) -> std::result::Result<tonic::Response<proto::StreamListResponse>, tonic::Status>
+        ) -> std::result::Result<tonic::Response<proto::GetStreamsByTagResponse>, tonic::Status>
         {
             Err(tonic::Status::unimplemented("stub"))
         }
@@ -1848,7 +2183,8 @@ mod tests {
         async fn enumerate_stream_ids(
             &self,
             _request: tonic::Request<proto::EnumerateStreamIdsRequest>,
-        ) -> std::result::Result<tonic::Response<proto::StreamIdsResponse>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<proto::EnumerateStreamIdsResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("stub"))
         }
 
@@ -1863,8 +2199,10 @@ mod tests {
         async fn get_streams_updated_after(
             &self,
             _request: tonic::Request<proto::GetStreamsUpdatedAfterRequest>,
-        ) -> std::result::Result<tonic::Response<proto::StreamListResponse>, tonic::Status>
-        {
+        ) -> std::result::Result<
+            tonic::Response<proto::GetStreamsUpdatedAfterResponse>,
+            tonic::Status,
+        > {
             Err(tonic::Status::unimplemented("stub"))
         }
     }

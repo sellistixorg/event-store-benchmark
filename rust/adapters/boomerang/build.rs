@@ -12,9 +12,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_file = format!("{proto_root}/sellistix/slingshot/v1/event_store.proto");
     println!("cargo:rerun-if-changed={proto_file}");
 
+    // <root> is the include path. google.protobuf.Timestamp is a well-known
+    // type; the generated field uses prost-types instead of a second copy.
     tonic_prost_build::configure()
         // Server stubs let unit tests host an in-process EventStoreService.
         .build_server(true)
+        .extern_path(".google.protobuf.Timestamp", "::prost_types::Timestamp")
         .compile_protos(&[&proto_file], &[&proto_root])?;
     Ok(())
 }

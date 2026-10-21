@@ -470,6 +470,7 @@ dependencies = [
  "bench-testcontainers",
  "libc",
  "prost",
+ "prost-types",
  "serde_json",
  "testcontainers",
  "tokio",
