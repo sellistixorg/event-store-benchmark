@@ -1,16 +1,38 @@
+
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::Image;
 
-const NAME: &str = "boomerang";
-const TAG: &str = "local";
+const DEFAULT_IMAGE: &str = "boomerang:local";
 
 /// Container port exposed by the Boomerang gRPC host (h2c).
 pub const BOOMERANG_PORT: ContainerPort = ContainerPort::Tcp(50051);
 
 #[derive(Debug, Clone)]
 pub struct Boomerang {
+    name: String,
+    tag: String,
     env_vars: Vec<(&'static str, String)>,
     mounts: Vec<Mount>,
+}
+
+/// `BOOMERANG_IMAGE` overrides the image the harness starts. `boomerang:local` is the default.
+/// `name:tag` splits on the last colon. A registry port (`localhost:5000/img:tag`) keeps the host.
+fn configured_image() -> (String, String, String) {
+    let raw = std::env::var("BOOMERANG_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
+    let raw = raw.trim();
+    let (name, tag) = if raw.is_empty() {
+        ("boomerang".to_string(), "local".to_string())
+    } else if let Some((name, tag)) = raw.rsplit_once(':') {
+        if !name.is_empty() && !tag.is_empty() && !tag.contains('/') {
+            (name.to_string(), tag.to_string())
+        } else {
+            (raw.to_string(), "latest".to_string())
+        }
+    } else {
+        (raw.to_string(), "latest".to_string())
+    };
+    let image_ref = format!("{name}:{tag}");
+    (name, tag, image_ref)
 }
 
 /// Optional host override forwarded into the container as `BOOMERANG_SEGMENT_MAX_BYTES`.
@@ -37,6 +59,7 @@ impl Boomerang {
             Some(path) => Mount::bind_mount(path, "/data"),
             None => Mount::volume_mount("", "/data"),
         };
+        let (name, tag, _image_ref) = configured_image();
         let mut env_vars = vec![
             ("BOOMERANG_DATA_DIR", "/data".to_string()),
             ("BOOMERANG_DURABILITY", durability.to_string()),
@@ -51,6 +74,8 @@ impl Boomerang {
             env_vars.push(("BOOMERANG_DELIVERY_LINGER_MS", ms));
         }
         Self {
+            name,
+            tag,
             env_vars,
             mounts: vec![mount],
         }
@@ -58,24 +83,25 @@ impl Boomerang {
 
     /// Runtime posture recorded in each run's `run_manifest.json`.
     pub fn describe(durability: &str) -> serde_json::Value {
+        let (.., image_ref) = configured_image();
         serde_json::json!({
-            "image": format!("{NAME}:{TAG}"),
+            "image": image_ref,
             "durability": durability,
-            "git_sha": image_git_sha(),
+            "git_sha": image_git_sha(&image_ref),
             "segment_max_bytes": segment_max_bytes_override(),
             "delivery_linger_ms": delivery_linger_override(),
         })
     }
 }
 
-/// Reads the `git.sha` label from the local `boomerang:local` image.
-fn image_git_sha() -> Option<String> {
+/// Reads the `git.sha` label from the image the harness will start.
+fn image_git_sha(image_ref: &str) -> Option<String> {
     let output = std::process::Command::new("docker")
         .args([
             "inspect",
             "--format",
             r#"{{index .Config.Labels "git.sha"}}"#,
-            &format!("{NAME}:{TAG}"),
+            image_ref,
         ])
         .output()
         .ok()?;
@@ -92,11 +118,11 @@ fn image_git_sha() -> Option<String> {
 
 impl Image for Boomerang {
     fn name(&self) -> &str {
-        NAME
+        &self.name
     }
 
     fn tag(&self) -> &str {
-        TAG
+        &self.tag
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {
@@ -122,3 +148,5 @@ impl Image for Boomerang {
         &[BOOMERANG_PORT]
     }
 }
+
+
