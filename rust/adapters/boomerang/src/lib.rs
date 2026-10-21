@@ -500,7 +500,7 @@ impl BoomerangAdapter {
         Ok(AppendStreamRequest {
             stream_id: Self::stream_id_from_events(events)?,
             events: Self::convert_events(events),
-            expected_version: Self::expected_version(stream_position),
+            expected_version: Self::expected_version(stream_position, events.len())?,
             tags: Self::batch_tags(events),
             metadata: Self::event_metadata(events),
             ..Default::default()
@@ -614,23 +614,33 @@ impl BoomerangAdapter {
     /// Optimistic stream version for `AppendStream`.
     ///
     /// `None` is an unconditional append. The field is omitted, which means no check.
+    /// Any number of events is allowed, because no version is sent.
     ///
     /// When concurrency control is on, the harness starts a stream at position 0
-    /// and adds 1 after each successful append. Those appends are one event
-    /// (`batch_size` defaults to 1), so after N events the next harness position
-    /// is N. Slingshot versions are 1-based: the first event is version 1, and
-    /// the stream version after N events is N. For N >= 1 those numbers match,
-    /// so the expected version is N.
+    /// and adds 1 after each successful append. The stream version is 1-based and
+    /// advances by the number of events, not by the number of appends. Position N
+    /// is the stream version only when every conditional append wrote one event:
+    /// after N such events the version is N. Position 0 is the new stream, whose
+    /// version is -1 (the stream must not exist). `0` is a real version and would
+    /// conflict, so it is not sent.
     ///
-    /// Position 0 is the new stream. A missing stream's version is -1, and -1
-    /// means the stream must not exist. 0 is a real version and conflicts on a
-    /// new stream, so it is not sent.
-    fn expected_version(stream_position: Option<usize>) -> Option<i64> {
-        match stream_position {
+    /// A conditional append of any other size is rejected. The adapter sees only
+    /// this call's position and events, not how many events earlier appends wrote,
+    /// so it cannot compute the stream version.
+    fn expected_version(
+        stream_position: Option<usize>,
+        event_count: usize,
+    ) -> anyhow::Result<Option<i64>> {
+        if stream_position.is_some() && event_count != 1 {
+            anyhow::bail!(
+                "conditional append of {event_count} events cannot set expected_version: the harness advances stream position by 1 per append, but the stream version advances by the event count, so position N is the stream version only when each conditional append writes one event"
+            );
+        }
+        Ok(match stream_position {
             None => None,
             Some(0) => Some(-1),
             Some(position) => Some(position as i64),
-        }
+        })
     }
 
     async fn append_stream_batch(
@@ -804,6 +814,9 @@ impl EventStoreAdapter for BoomerangAdapter {
         if events.is_empty() {
             return Ok(None);
         }
+        // Check the original batch before a per-event split, so several events
+        // are not sent as one-event appends with a version that ignores the batch.
+        let _ = Self::expected_version(stream_position, events.len())?;
         if Self::tags_heterogeneous(events) {
             let mut last = None;
             for evt in events {
@@ -1136,10 +1149,19 @@ mod tests {
             BoomerangAdapter::stream_id_from_events(&events).unwrap(),
             "tag1"
         );
-        assert_eq!(BoomerangAdapter::expected_version(None), None);
-        assert_eq!(BoomerangAdapter::expected_version(Some(0)), Some(-1));
-        assert_eq!(BoomerangAdapter::expected_version(Some(1)), Some(1));
-        assert_eq!(BoomerangAdapter::expected_version(Some(9)), Some(9));
+        assert_eq!(BoomerangAdapter::expected_version(None, 1).unwrap(), None);
+        assert_eq!(
+            BoomerangAdapter::expected_version(Some(0), 1).unwrap(),
+            Some(-1)
+        );
+        assert_eq!(
+            BoomerangAdapter::expected_version(Some(1), 1).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            BoomerangAdapter::expected_version(Some(9), 1).unwrap(),
+            Some(9)
+        );
         let empty = EventData {
             payload: Arc::from(vec![1u8]),
             event_type: Arc::from("t"),
@@ -1160,29 +1182,81 @@ mod tests {
             metadata: Arc::from([]),
         };
 
-        assert_eq!(BoomerangAdapter::expected_version(None), None);
+        assert_eq!(BoomerangAdapter::expected_version(None, 1).unwrap(), None);
         let unconditional =
             BoomerangAdapter::append_stream_request(std::slice::from_ref(&event), None).unwrap();
         assert!(unconditional.expected_version.is_none());
 
-        assert_eq!(BoomerangAdapter::expected_version(Some(0)), Some(-1));
+        assert_eq!(
+            BoomerangAdapter::expected_version(Some(0), 1).unwrap(),
+            Some(-1)
+        );
         let created =
             BoomerangAdapter::append_stream_request(std::slice::from_ref(&event), Some(0)).unwrap();
         assert_eq!(created.expected_version, Some(-1));
 
         // After the first event the stream version is 1. The next harness
         // position is 1, so the expected version is 1, not 0.
-        assert_eq!(BoomerangAdapter::expected_version(Some(1)), Some(1));
+        assert_eq!(
+            BoomerangAdapter::expected_version(Some(1), 1).unwrap(),
+            Some(1)
+        );
         let second =
             BoomerangAdapter::append_stream_request(std::slice::from_ref(&event), Some(1)).unwrap();
         assert_eq!(second.expected_version, Some(1));
 
         // After N events the version is N.
-        assert_eq!(BoomerangAdapter::expected_version(Some(2)), Some(2));
-        assert_eq!(BoomerangAdapter::expected_version(Some(9)), Some(9));
+        assert_eq!(
+            BoomerangAdapter::expected_version(Some(2), 1).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            BoomerangAdapter::expected_version(Some(9), 1).unwrap(),
+            Some(9)
+        );
         let tenth =
             BoomerangAdapter::append_stream_request(std::slice::from_ref(&event), Some(9)).unwrap();
         assert_eq!(tenth.expected_version, Some(9));
+    }
+
+    #[test]
+    fn conditional_append_of_many_events_is_rejected() {
+        let events = [
+            EventData {
+                payload: Arc::from(vec![1u8]),
+                event_type: Arc::from("t"),
+                tags: Arc::from([Arc::from("stream-a")]),
+                metadata: Arc::from([]),
+            },
+            EventData {
+                payload: Arc::from(vec![2u8]),
+                event_type: Arc::from("t"),
+                tags: Arc::from([Arc::from("stream-a")]),
+                metadata: Arc::from([]),
+            },
+        ];
+
+        for position in [Some(0usize), Some(1), Some(9)] {
+            let message = BoomerangAdapter::expected_version(position, events.len())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("expected_version")
+                    && message.contains("one event")
+                    && message.contains('2'),
+                "{position:?} => {message}"
+            );
+            let request = BoomerangAdapter::append_stream_request(&events, position).unwrap_err();
+            assert!(request.to_string().contains("one event"), "{request}");
+        }
+
+        // No version check. A batch of any size still omits expected_version.
+        let open = BoomerangAdapter::append_stream_request(&events, None).unwrap();
+        assert!(open.expected_version.is_none());
+        assert_eq!(open.events.len(), 2);
+        assert!(BoomerangAdapter::expected_version(None, 64)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
