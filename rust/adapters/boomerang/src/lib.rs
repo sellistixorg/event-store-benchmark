@@ -869,23 +869,34 @@ enum EventStream {
 }
 
 impl EventStream {
-    /// The stream item is a wrapper. The sequenced event is field 1. A wrapper
-    /// with no event is skipped so it is not the end of the stream.
-    async fn message(&mut self) -> Result<Option<SequencedEventProto>, tonic::Status> {
-        loop {
-            let event = match self {
-                Self::ByQuery(stream) => match stream.message().await? {
-                    Some(response) => response.event,
-                    None => return Ok(None),
-                },
-                Self::Subscribe(stream) => match stream.message().await? {
-                    Some(response) => response.event,
-                    None => return Ok(None),
-                },
-            };
-            if event.is_some() {
-                return Ok(event);
-            }
+    /// The stream item is a wrapper. The sequenced event is field 1.
+    /// The stream ending is `Ok(None)`. A wrapper that omits the event is a
+    /// protocol error, not a gap to skip and not the end of the stream.
+    async fn message(&mut self) -> anyhow::Result<Option<SequencedEventProto>> {
+        let (call, item) = match self {
+            Self::ByQuery(stream) => (
+                "ReadByQueryStream",
+                stream
+                    .message()
+                    .await
+                    .map_err(|status| grpc_status_error(status, "ReadByQueryStream"))?
+                    .map(|response| response.event),
+            ),
+            Self::Subscribe(stream) => (
+                "Subscribe",
+                stream
+                    .message()
+                    .await
+                    .map_err(|status| grpc_status_error(status, "Subscribe"))?
+                    .map(|response| response.event),
+            ),
+        };
+        match item {
+            None => Ok(None),
+            Some(Some(event)) => Ok(Some(event)),
+            Some(None) => Err(anyhow::anyhow!(
+                "protocol error: {call} item has no event. The response must set the event field"
+            )),
         }
     }
 }
@@ -899,21 +910,10 @@ struct BoomerangReadResponse {
 impl ReadResponse for BoomerangReadResponse {
     async fn next_event(&mut self) -> anyhow::Result<Option<ReadEvent>> {
         if matches!(self.remaining, Some(0)) {
-            while self
-                .stream
-                .message()
-                .await
-                .map_err(|status| grpc_status_error(status, "stream"))?
-                .is_some()
-            {}
+            while self.stream.message().await?.is_some() {}
             return Ok(None);
         }
-        match self
-            .stream
-            .message()
-            .await
-            .map_err(|status| grpc_status_error(status, "stream"))?
-        {
+        match self.stream.message().await? {
             Some(proto) => {
                 if let Some(ref mut n) = self.remaining {
                     *n = n.saturating_sub(1);
@@ -2256,5 +2256,277 @@ mod tests {
                 });
             assert_eq!(call.context.as_deref(), Some(expected.as_str()), "{rpc}");
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum StreamScript {
+        End,
+        MissingEvent,
+        OneEvent,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ScriptedStore {
+        script: StreamScript,
+    }
+
+    struct Scripted<T> {
+        item: Option<T>,
+    }
+
+    impl<T: Unpin> tonic::codegen::tokio_stream::Stream for Scripted<T> {
+        type Item = std::result::Result<T, tonic::Status>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.get_mut().item.take().map(Ok))
+        }
+    }
+
+    fn scripted_query(script: StreamScript) -> Scripted<proto::ReadByQueryStreamResponse> {
+        let item = match script {
+            StreamScript::End => None,
+            StreamScript::MissingEvent => Some(proto::ReadByQueryStreamResponse {
+                ..Default::default()
+            }),
+            StreamScript::OneEvent => Some(proto::ReadByQueryStreamResponse {
+                event: Some(SequencedEventProto {
+                    sequence_position: 3,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        Scripted { item }
+    }
+
+    fn scripted_subscribe(script: StreamScript) -> Scripted<proto::SubscribeResponse> {
+        let item = match script {
+            StreamScript::End => None,
+            StreamScript::MissingEvent => Some(proto::SubscribeResponse {
+                ..Default::default()
+            }),
+            StreamScript::OneEvent => Some(proto::SubscribeResponse {
+                event: Some(SequencedEventProto {
+                    sequence_position: 3,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        Scripted { item }
+    }
+
+    #[async_trait::async_trait]
+    impl proto::event_store_service_server::EventStoreService for ScriptedStore {
+        async fn append_stream(
+            &self,
+            _request: tonic::Request<AppendStreamRequest>,
+        ) -> std::result::Result<tonic::Response<proto::AppendStreamResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn append_dcb(
+            &self,
+            _request: tonic::Request<AppendDcbRequest>,
+        ) -> std::result::Result<tonic::Response<proto::AppendDcbResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn read_stream(
+            &self,
+            _request: tonic::Request<ReadStreamRequest>,
+        ) -> std::result::Result<tonic::Response<proto::ReadStreamResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        type ReadStreamEnumerableStream = EmptyStream<proto::ReadStreamEnumerableResponse>;
+
+        async fn read_stream_enumerable(
+            &self,
+            _request: tonic::Request<proto::ReadStreamEnumerableRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ReadStreamEnumerableStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn read_by_query(
+            &self,
+            _request: tonic::Request<ReadByQueryRequest>,
+        ) -> std::result::Result<tonic::Response<proto::ReadByQueryResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        type ReadByQueryStreamStream = Scripted<proto::ReadByQueryStreamResponse>;
+
+        async fn read_by_query_stream(
+            &self,
+            _request: tonic::Request<ReadByQueryStreamRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ReadByQueryStreamStream>, tonic::Status>
+        {
+            Ok(tonic::Response::new(scripted_query(self.script)))
+        }
+
+        type SubscribeStream = Scripted<proto::SubscribeResponse>;
+
+        async fn subscribe(
+            &self,
+            _request: tonic::Request<SubscribeRequest>,
+        ) -> std::result::Result<tonic::Response<Self::SubscribeStream>, tonic::Status> {
+            Ok(tonic::Response::new(scripted_subscribe(self.script)))
+        }
+
+        async fn get_current_sequence(
+            &self,
+            _request: tonic::Request<GetCurrentSequenceRequest>,
+        ) -> std::result::Result<tonic::Response<proto::GetCurrentSequenceResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_stream(
+            &self,
+            _request: tonic::Request<proto::GetStreamRequest>,
+        ) -> std::result::Result<tonic::Response<proto::GetStreamResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_streams_by_aggregate_type(
+            &self,
+            _request: tonic::Request<proto::GetStreamsByAggregateTypeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<proto::GetStreamsByAggregateTypeResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_streams_by_tag(
+            &self,
+            _request: tonic::Request<proto::GetStreamsByTagRequest>,
+        ) -> std::result::Result<tonic::Response<proto::GetStreamsByTagResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn enumerate_stream_ids(
+            &self,
+            _request: tonic::Request<proto::EnumerateStreamIdsRequest>,
+        ) -> std::result::Result<tonic::Response<proto::EnumerateStreamIdsResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_stream_count(
+            &self,
+            _request: tonic::Request<proto::GetStreamCountRequest>,
+        ) -> std::result::Result<tonic::Response<proto::GetStreamCountResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+
+        async fn get_streams_updated_after(
+            &self,
+            _request: tonic::Request<proto::GetStreamsUpdatedAfterRequest>,
+        ) -> std::result::Result<
+            tonic::Response<proto::GetStreamsUpdatedAfterResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("stub"))
+        }
+    }
+
+    async fn scripted_client(script: StreamScript) -> BoomerangClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(
+                    proto::event_store_service_server::EventStoreServiceServer::new(
+                        ScriptedStore { script },
+                    ),
+                )
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        connect_client(&format!("http://{addr}")).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn stream_item_without_event_is_a_protocol_error() {
+        let mut missing = scripted_client(StreamScript::MissingEvent).await;
+        let mut query = EventStream::ByQuery(
+            missing
+                .read_by_query_stream(ReadByQueryStreamRequest {
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+        let query_message = query
+            .message()
+            .await
+            .expect_err("wrapper with no event")
+            .to_string();
+        assert!(
+            query_message.contains("protocol error")
+                && query_message.contains("ReadByQueryStream")
+                && query_message.contains("no event"),
+            "{query_message}"
+        );
+
+        let mut subscribe = EventStream::Subscribe(
+            missing
+                .subscribe(SubscribeRequest {
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+        let subscribe_message = subscribe
+            .message()
+            .await
+            .expect_err("wrapper with no event")
+            .to_string();
+        assert!(
+            subscribe_message.contains("protocol error")
+                && subscribe_message.contains("Subscribe")
+                && subscribe_message.contains("no event")
+                && !subscribe_message.contains("ReadByQueryStream"),
+            "{subscribe_message}"
+        );
+
+        let mut ended = scripted_client(StreamScript::End).await;
+        let mut query_end = EventStream::ByQuery(
+            ended
+                .read_by_query_stream(ReadByQueryStreamRequest {
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+        assert!(query_end.message().await.unwrap().is_none());
+
+        let mut present = scripted_client(StreamScript::OneEvent).await;
+        let mut query_one = EventStream::ByQuery(
+            present
+                .read_by_query_stream(ReadByQueryStreamRequest {
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+        let event = query_one.message().await.unwrap().expect("event");
+        assert_eq!(event.sequence_position, 3);
     }
 }
